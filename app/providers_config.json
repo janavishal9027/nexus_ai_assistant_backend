@@ -1,0 +1,78 @@
+{
+  "providers": [
+    {
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "description": "Aggregator with 100+ free models",
+      "type": "openai_compat",
+      "base_url": "https://openrouter.ai/api/v1",
+      "key_url": "https://openrouter.ai/settings/keys",
+      "icon": "router",
+      "color": "#3B82F6",
+      "extra_headers": {
+        "HTTP-Referer": "http://localhost:8080",
+        "X-Title": "ChatApp"
+      },
+      "models": []
+    },
+    {
+      "id": "groq",
+      "name": "Groq",
+      "description": "Ultra-fast inference (Llama, Gemma, Mixtral)",
+      "type": "openai_compat",
+      "base_url": "https://api.groq.com/openai/v1",
+      "key_url": "https://console.groq.com/keys",
+      "icon": "flash_on",
+      "color": "#F97316",
+      "extra_headers": {},
+      "models": []
+    },
+    {
+      "id": "nvidia",
+      "name": "NVIDIA NIM",
+      "description": "GPU-optimized model inference",
+      "type": "openai_compat",
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "key_url": "https://build.nvidia.com",
+      "icon": "memory",
+      "color": "#22C55E",
+      "extra_headers": {},
+      "models": []
+    },
+    {
+      "id": "huggingface",
+      "name": "HuggingFace",
+      "description": "Open-source model router",
+      "type": "openai_compat",
+      "base_url": "https://router.huggingface.co/v1",
+      "key_url": "https://huggingface.co/settings/tokens",
+      "icon": "pets",
+      "color": "#EAB308",
+      "extra_headers": {},
+      "models": []
+    },
+    {
+      "id": "google",
+      "name": "Google AI Studio",
+      "description": "Gemini models (generous free tier)",
+      "type": "gemini",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "key_url": "https://aistudio.google.com/apikey",
+      "icon": "auto_awesome",
+      "color": "#06B6D4",
+      "extra_headers": {},
+      "models": []
+    }
+  ],
+  "agent": {
+    "system_prompt": "You are a helpful, knowledgeable AI assistant. Provide clear, well-structured responses. Use markdown formatting when appropriate: headings for sections, code blocks for code, lists for enumeration, and bold for emphasis. Be concise but thorough.",
+    "max_context_messages": 20,
+    "default_temperature": 0.7,
+    "default_max_tokens": 4096
+  },
+  "fallback": {
+    "max_retries": 10,
+    "cooldown_seconds": 90,
+    "escalated_cooldown_seconds": 600
+  }
+}
