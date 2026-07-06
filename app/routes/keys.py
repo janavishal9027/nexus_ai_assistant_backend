@@ -4,11 +4,16 @@ from pydantic import BaseModel
 from typing import Optional
 
 from ..database import get_db
-from ..models.db_models import ApiKey
+from ..models.db_models import ApiKey, Account
 from ..models.schemas import AddKeyRequest
 from ..providers.registry import provider_registry
+from ..services.auth import get_current_account
 
 router = APIRouter(prefix="/api/keys", tags=["keys"])
+
+# Non-LLM API keys accepted here (e.g. web-search providers). These aren't in the
+# LLM provider_registry but are valid keys the user configures in the UI.
+SEARCH_PLATFORMS = {"tavily"}
 
 
 def _mask_key(key: str) -> str:
@@ -18,8 +23,15 @@ def _mask_key(key: str) -> str:
 
 
 @router.get("/")
-def get_all(db: Session = Depends(get_db)):
-    keys = db.query(ApiKey).order_by(ApiKey.created_at.desc()).all()
+def get_all(db: Session = Depends(get_db), account: Account = Depends(get_current_account)):
+    # Only the account's own keys are shown/managed; shared/global (owner_id NULL)
+    # keys remain usable for chat but aren't editable per-user.
+    keys = (
+        db.query(ApiKey)
+        .filter(ApiKey.owner_id == account.id)
+        .order_by(ApiKey.created_at.desc())
+        .all()
+    )
     return [
         {
             "id": k.id,
@@ -35,8 +47,9 @@ def get_all(db: Session = Depends(get_db)):
 
 
 @router.post("/")
-def add_key(request: AddKeyRequest, db: Session = Depends(get_db)):
-    if not provider_registry.has(request.platform):
+async def add_key(request: AddKeyRequest, db: Session = Depends(get_db),
+                  account: Account = Depends(get_current_account)):
+    if not provider_registry.has(request.platform) and request.platform not in SEARCH_PLATFORMS:
         raise HTTPException(status_code=400, detail=f"Unsupported platform: {request.platform}")
 
     if not request.key.strip():
@@ -44,7 +57,11 @@ def add_key(request: AddKeyRequest, db: Session = Depends(get_db)):
 
     existing = (
         db.query(ApiKey)
-        .filter(ApiKey.platform == request.platform, ApiKey.api_key == request.key)
+        .filter(
+            ApiKey.platform == request.platform,
+            ApiKey.api_key == request.key,
+            ApiKey.owner_id == account.id,
+        )
         .first()
     )
     if existing:
@@ -56,22 +73,38 @@ def add_key(request: AddKeyRequest, db: Session = Depends(get_db)):
         label=request.label or "",
         enabled=True,
         status="unknown",
+        owner_id=account.id,
     )
     db.add(api_key)
     db.commit()
     db.refresh(api_key)
+
+    # Auto-sync this provider's model catalog so the models appear immediately
+    # after adding the key. Only LLM providers have models; search keys (Tavily)
+    # do not, so skip the sync for those.
+    models_synced = 0
+    if provider_registry.has(request.platform):
+        try:
+            from ..services.model_sync import sync_provider_models
+            result = await sync_provider_models(db, request.platform)
+            if isinstance(result, dict):
+                models_synced = result.get("added", 0)
+        except Exception:
+            pass  # key is still saved even if the model fetch fails
 
     return {
         "id": api_key.id,
         "platform": api_key.platform,
         "maskedKey": _mask_key(api_key.api_key),
         "status": "unknown",
+        "models_synced": models_synced,
     }
 
 
 @router.delete("/{key_id}")
-def delete_key(key_id: int, db: Session = Depends(get_db)):
-    key = db.query(ApiKey).filter(ApiKey.id == key_id).first()
+def delete_key(key_id: int, db: Session = Depends(get_db),
+               account: Account = Depends(get_current_account)):
+    key = db.query(ApiKey).filter(ApiKey.id == key_id, ApiKey.owner_id == account.id).first()
     if not key:
         raise HTTPException(status_code=404, detail="Key not found")
     db.delete(key)
@@ -84,8 +117,9 @@ class ToggleKey(BaseModel):
 
 
 @router.patch("/{key_id}")
-def toggle_key(key_id: int, body: ToggleKey, db: Session = Depends(get_db)):
-    key = db.query(ApiKey).filter(ApiKey.id == key_id).first()
+def toggle_key(key_id: int, body: ToggleKey, db: Session = Depends(get_db),
+               account: Account = Depends(get_current_account)):
+    key = db.query(ApiKey).filter(ApiKey.id == key_id, ApiKey.owner_id == account.id).first()
     if not key:
         raise HTTPException(status_code=404, detail="Key not found")
     if body.enabled is not None:

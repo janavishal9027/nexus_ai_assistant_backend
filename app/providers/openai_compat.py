@@ -134,10 +134,24 @@ class OpenAICompatProvider(LlmProvider):
         body: dict = {
             "model": model_id,
             "stream": stream,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "messages": [{"role": self._api_role(m.role), "content": m.content} for m in messages],
         }
         if temperature is not None:
             body["temperature"] = temperature
         if max_tokens and max_tokens > 0:
             body["max_tokens"] = max_tokens
         return body
+
+    @staticmethod
+    def _api_role(role: str) -> str:
+        """Map an internal message role to an OpenAI-compatible API role.
+
+        OpenAI-compatible APIs only accept ``system``/``user``/``assistant`` unless
+        the full native tool-calling protocol is used (an assistant message with
+        ``tool_calls`` followed by ``tool`` messages carrying ``tool_call_id``).
+        This app represents tool output as plain context messages via the
+        DecisionEngine (no ``tool_call_id``), so any non-standard role — notably
+        ``tool`` — is mapped to ``user`` to satisfy strict providers like Groq,
+        which otherwise reject a ``role:"tool"`` message that lacks ``tool_call_id``.
+        """
+        return role if role in ("system", "user", "assistant") else "user"

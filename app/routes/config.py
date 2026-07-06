@@ -3,18 +3,20 @@ Config endpoint — serves the unified providers config to the frontend.
 The frontend uses this to dynamically render providers, models, and status.
 """
 from fastapi import APIRouter, Depends
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models.db_models import ApiKey, ChatModel
+from ..models.db_models import ApiKey, ChatModel, Account
 from ..services.agent import get_config, reload_config
+from ..services.auth import get_current_account
 from ..services.model_sync import sync_all_providers, sync_provider_models
 
 router = APIRouter(prefix="/api/config", tags=["config"])
 
 
 @router.get("/")
-def get_app_config(db: Session = Depends(get_db)):
+def get_app_config(db: Session = Depends(get_db), account: Account = Depends(get_current_account)):
     """
     Returns the full app config enriched with key status and DB models.
     The frontend uses this single endpoint to know:
@@ -25,8 +27,13 @@ def get_app_config(db: Session = Depends(get_db)):
     """
     config = get_config()
 
-    # Count active keys per platform
-    keys = db.query(ApiKey).filter(ApiKey.enabled == True).all()
+    # Count active keys per platform visible to this account (own + shared/global)
+    keys = (
+        db.query(ApiKey)
+        .filter(ApiKey.enabled == True,
+                or_(ApiKey.owner_id == account.id, ApiKey.owner_id.is_(None)))
+        .all()
+    )
     key_counts: dict[str, int] = {}
     for k in keys:
         key_counts[k.platform] = key_counts.get(k.platform, 0) + 1

@@ -4,16 +4,27 @@ from pydantic import BaseModel
 from typing import Optional
 
 from ..database import get_db
-from ..models.db_models import Conversation, Message, ChatModel
+from ..models.db_models import Conversation, Message, ChatModel, Account
 from ..models.schemas import ConversationDto, MessageDto
+from ..services.auth import get_current_account
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
 
+def _owned_or_404(db: Session, conversation_id: int, account_id: int) -> Conversation:
+    """Fetch a conversation only if it belongs to the account (else 404, so
+    existence isn't leaked across accounts)."""
+    conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    if conv is None or conv.owner_id != account_id:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return conv
+
+
 @router.get("/")
-def get_all(db: Session = Depends(get_db)):
+def get_all(db: Session = Depends(get_db), account: Account = Depends(get_current_account)):
     conversations = (
         db.query(Conversation)
+        .filter(Conversation.owner_id == account.id)
         .order_by(Conversation.updated_at.desc())
         .all()
     )
@@ -29,10 +40,9 @@ def get_all(db: Session = Depends(get_db)):
 
 
 @router.get("/{conversation_id}")
-def get_by_id(conversation_id: int, db: Session = Depends(get_db)):
-    conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+def get_by_id(conversation_id: int, db: Session = Depends(get_db),
+              account: Account = Depends(get_current_account)):
+    conv = _owned_or_404(db, conversation_id, account.id)
 
     messages = (
         db.query(Message)
@@ -67,10 +77,21 @@ def get_by_id(conversation_id: int, db: Session = Depends(get_db)):
 
 
 @router.delete("/{conversation_id}")
-def delete(conversation_id: int, db: Session = Depends(get_db)):
-    conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+def delete(conversation_id: int, db: Session = Depends(get_db),
+           account: Account = Depends(get_current_account)):
+    conv = _owned_or_404(db, conversation_id, account.id)
     if conv:
-        db.delete(conv)
+        # Remove rows added by the agent feature that reference this conversation
+        # via a foreign key (memory_chunks). Without this the DELETE violates the
+        # FK constraint and fails with a 500, and the row reappears on next load.
+        try:
+            from ..models.db_models import MemoryChunk
+            db.query(MemoryChunk).filter(
+                MemoryChunk.conversation_id == conversation_id
+            ).delete(synchronize_session=False)
+        except Exception:
+            db.rollback()
+        db.delete(conv)          # messages cascade via the ORM relationship
         db.commit()
     return {"success": True}
 
@@ -80,10 +101,9 @@ class UpdateTitle(BaseModel):
 
 
 @router.patch("/{conversation_id}")
-def update_title(conversation_id: int, body: UpdateTitle, db: Session = Depends(get_db)):
-    conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+def update_title(conversation_id: int, body: UpdateTitle, db: Session = Depends(get_db),
+                 account: Account = Depends(get_current_account)):
+    conv = _owned_or_404(db, conversation_id, account.id)
     if body.title:
         conv.title = body.title
         db.commit()

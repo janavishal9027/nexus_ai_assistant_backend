@@ -1,14 +1,39 @@
 import logging
 from dataclasses import dataclass
+from pathlib import Path
+import json
 from typing import AsyncGenerator
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ..models.db_models import ChatModel, ApiKey
 from ..models.schemas import MessageDto
 from ..providers.registry import provider_registry
 from . import rate_limit
+from . import request_context
 
 logger = logging.getLogger(__name__)
+
+_config_path = Path(__file__).parent.parent / "providers_config.json"
+
+
+def _get_max_retries() -> int:
+    """Read max_retries from providers_config.json. Defaults to 3."""
+    try:
+        data = json.loads(_config_path.read_text(encoding="utf-8"))
+        return int(data.get("fallback", {}).get("max_retries", 3))
+    except Exception:
+        return 3
+
+
+def _apply_owner_scope(query):
+    """Restrict ApiKey rows to the current account's own keys plus shared/global
+    (owner_id NULL) keys. No-op when no authenticated owner is in context, so
+    internal/system calls keep working."""
+    owner_id = request_context.get_owner_id()
+    if owner_id is None:
+        return query
+    return query.filter(or_(ApiKey.owner_id == owner_id, ApiKey.owner_id.is_(None)))
 
 
 @dataclass
@@ -110,7 +135,9 @@ def _get_ordered_models(
     # Get platforms with active keys
     active_platforms = set(
         row[0] for row in
-        db.query(ApiKey.platform).filter(ApiKey.enabled == True, ApiKey.status != "error").distinct().all()
+        _apply_owner_scope(
+            db.query(ApiKey.platform).filter(ApiKey.enabled == True, ApiKey.status != "error")
+        ).distinct().all()
     )
 
     models = (
@@ -156,9 +183,11 @@ async def route_chat(
     requested_model: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
-    max_retries: int = 10,
+    max_retries: int | None = None,
 ) -> RouteResult:
     """Route a chat request with automatic fallback across models and keys."""
+    if max_retries is None:
+        max_retries = _get_max_retries()
     models = _get_ordered_models(db, requested_model, messages)
     skip_keys: set[str] = set()
     skip_models: set[int] = set()
@@ -174,11 +203,12 @@ async def route_chat(
                 continue
 
             keys = (
-                db.query(ApiKey)
-                .filter(
-                    ApiKey.platform == model.platform,
-                    ApiKey.enabled == True,
-                    ApiKey.status != "error",
+                _apply_owner_scope(
+                    db.query(ApiKey).filter(
+                        ApiKey.platform == model.platform,
+                        ApiKey.enabled == True,
+                        ApiKey.status != "error",
+                    )
                 )
                 .all()
             )
@@ -251,9 +281,11 @@ async def route_stream_chat(
     requested_model: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
-    max_retries: int = 10,
+    max_retries: int | None = None,
 ) -> StreamRouteResult:
     """Route a streaming chat request with fallback."""
+    if max_retries is None:
+        max_retries = _get_max_retries()
     models = _get_ordered_models(db, requested_model, messages)
     skip_keys: set[str] = set()
     skip_models: set[int] = set()
@@ -269,11 +301,12 @@ async def route_stream_chat(
                 continue
 
             keys = (
-                db.query(ApiKey)
-                .filter(
-                    ApiKey.platform == model.platform,
-                    ApiKey.enabled == True,
-                    ApiKey.status != "error",
+                _apply_owner_scope(
+                    db.query(ApiKey).filter(
+                        ApiKey.platform == model.platform,
+                        ApiKey.enabled == True,
+                        ApiKey.status != "error",
+                    )
                 )
                 .all()
             )
@@ -301,10 +334,27 @@ async def route_stream_chat(
                         max_tokens=max_tokens,
                     )
 
+                    # Prime the stream: pull the first chunk here so provider errors
+                    # (e.g. a 403 auth failure) are raised *inside* this retry loop
+                    # and fall back to the next model — instead of after the router
+                    # has already returned, which would surface as a hard failure.
+                    agen = stream.__aiter__()
+                    try:
+                        first_chunk = await agen.__anext__()
+                        has_first = True
+                    except StopAsyncIteration:
+                        first_chunk, has_first = None, False
+
+                    async def _primed_stream(_agen=agen, _first=first_chunk, _has=has_first):
+                        if _has:
+                            yield _first
+                        async for chunk in _agen:
+                            yield chunk
+
                     rate_limit.record_success(model.platform, model.model_id, key.id)
 
                     return StreamRouteResult(
-                        stream=stream,
+                        stream=_primed_stream(),
                         model_id=model.model_id,
                         platform=model.platform,
                         display_name=model.display_name,

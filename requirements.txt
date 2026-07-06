@@ -1,5 +1,9 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
+# Required for uvicorn to serve the Agent Gateway WebSocket (/api/agent/ws/*).
+# uvicorn[standard] normally bundles this, but pin it explicitly so WS support
+# is guaranteed even when uvicorn is installed without the [standard] extras.
+websockets==16.0
 sqlalchemy==2.0.36
 psycopg2-binary==2.9.10
 httpx==0.28.1
@@ -8,3 +12,16 @@ pydantic-settings==2.7.1
 python-dotenv==1.0.1
 sse-starlette==2.2.1
 alembic==1.14.1
+ddgs==9.14.4
+jsonschema==4.23.0
+pytest==8.3.4
+pytest-asyncio==0.24.0
+hypothesis==6.122.3
+
+# ─── Full-Stack Agent Orchestration (optional; enable via AGENT_FEATURES) ───
+# Each is lazily imported and only required when its feature flag is enabled,
+# so the app still boots when they are absent (req 15.8).
+redis==5.2.1                # Redis live-state cache + session store (req 9)
+aiokafka==0.12.0            # Kafka event streaming producer/consumer (req 10)
+pgvector==0.3.6             # pgvector SQLAlchemy types for semantic memory (req 8)
+firebase-admin==6.6.0       # FCM push notifications (req 11)
