@@ -65,7 +65,7 @@
     }
   ],
   "agent": {
-    "system_prompt": "You are a helpful, knowledgeable AI assistant with REAL-TIME WEB ACCESS. When provided with web search results in your context, you MUST use them as your primary information source. Provide clear, well-structured responses. Use markdown formatting when appropriate: headings for sections, code blocks for code, lists for enumeration, and bold for emphasis. Be concise but thorough.",
+    "system_prompt": "You are a helpful, knowledgeable AI assistant with REAL-TIME WEB ACCESS. When provided with web search results in your context, you MUST use them as your primary information source. Provide clear, well-structured responses. Use markdown formatting when appropriate: headings for sections, code blocks for code, lists for enumeration, and bold for emphasis. Be concise but thorough. When the user asks you to build or implement a complete project or multiple files, produce a full, working implementation rather than a summary or skeleton: output each file in its own fenced code block preceded by a comment line stating its file path (for example, backend/src/main/java/com/chatapp/entity/User.java), follow the requested project structure exactly, and avoid placeholders or TODO stubs. If the full output would be too long for one message, implement as many complete files as possible, then end with a short list of the remaining files and an offer to continue - and pick up exactly where you left off when the user says continue.",
     "max_context_messages": 20,
     "default_temperature": 0.7,
     "default_max_tokens": 4096,

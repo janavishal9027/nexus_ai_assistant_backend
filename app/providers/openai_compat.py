@@ -106,6 +106,56 @@ class OpenAICompatProvider(LlmProvider):
                     except json.JSONDecodeError:
                         continue
 
+    async def stream_chat_completion_ex(
+        self,
+        api_key: str,
+        messages: list[MessageDto],
+        model_id: str,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        """Streaming with completion metadata: yields content deltas and a final
+        finish event carrying finish_reason ("length" = truncated, "stop" = done)."""
+        body = self._build_body(messages, model_id, temperature, max_tokens, stream=True)
+        headers = self._build_headers(api_key)
+        finish_reason: str | None = None
+
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            async with client.stream(
+                "POST",
+                f"{self._base_url}/chat/completions",
+                json=body,
+                headers=headers,
+            ) as resp:
+                if resp.status_code != 200:
+                    error = await resp.aread()
+                    raise RuntimeError(
+                        f"{self._platform} stream error {resp.status_code}: {error.decode()[:300]}"
+                    )
+
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = chunk.get("choices", [])
+                    if not choices:
+                        continue
+                    fr = choices[0].get("finish_reason")
+                    if fr:
+                        finish_reason = fr
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        yield {"type": "content", "text": content}
+
+        yield {"type": "finish", "reason": finish_reason}
+
     async def validate_key(self, api_key: str) -> bool:
         headers = self._build_headers(api_key)
         try:

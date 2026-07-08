@@ -9,6 +9,7 @@ from ..database import get_db
 from ..models.db_models import Account, Conversation, Message, MemoryChunk, ApiKey
 from ..models.schemas import (
     SignupRequest, LoginRequest, AuthResponse, AccountDto, ChangePasswordRequest,
+    UpdateProfileRequest,
 )
 from ..services import auth as auth_service
 
@@ -58,6 +59,30 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
 
 @router.get("/me", response_model=AccountDto)
 def me(account: Account = Depends(auth_service.get_current_account)):
+    return AccountDto.model_validate(account)
+
+
+@router.patch("/me", response_model=AccountDto)
+def update_profile(body: UpdateProfileRequest, db: Session = Depends(get_db),
+                   account: Account = Depends(auth_service.get_current_account)):
+    """Update the current account's name and/or email."""
+    if body.email is not None:
+        email = _normalize_email(body.email)
+        if not _EMAIL_RE.match(email):
+            raise HTTPException(status_code=422, detail="Please enter a valid email address")
+        clash = (
+            db.query(Account)
+            .filter(Account.email == email, Account.id != account.id)
+            .first()
+        )
+        if clash is not None:
+            raise HTTPException(status_code=409, detail="That email is already in use")
+        account.email = email
+    if body.name is not None:
+        account.name = body.name.strip() or None
+    db.commit()
+    db.refresh(account)
+    logger.info(f"[Auth] Profile updated for account id={account.id}")
     return AccountDto.model_validate(account)
 
 

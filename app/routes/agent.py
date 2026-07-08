@@ -141,6 +141,7 @@ async def _handle_ws_chat(session_id: str, data: dict, owner_id: int | None = No
     plan_created → tool_start/tool_end → token(s) → done (req 2, 3.10)."""
     from datetime import datetime, timezone
     from ..services.agent import agent_stream_chat, _publish_event
+    from ..services.fallback_router import DeepResearchUnavailableError
     from ..services import request_context
     from ..services.feature_flags import get_agent_features
     from ..services.memory_manager import memory_manager
@@ -172,7 +173,12 @@ async def _handle_ws_chat(session_id: str, data: dict, owner_id: int | None = No
         async def on_tool_event(ev: dict) -> None:
             await ws_manager.send(session_id, ev)
 
-        req = ChatRequest(message=message, conversation_id=conversation_id_in, model=data.get("model"))
+        req = ChatRequest(
+            message=message,
+            conversation_id=conversation_id_in,
+            model=data.get("model"),
+            deep_research=bool(data.get("deep_research", False)),
+        )
         conversation_id, stream_result, citations = await agent_stream_chat(
             db, req, on_tool_event=on_tool_event, owner_id=owner_id)
 
@@ -200,6 +206,10 @@ async def _handle_ws_chat(session_id: str, data: dict, owner_id: int | None = No
             "type": "done", "conversation_id": conversation_id,
             "model": stream_result.display_name, "platform": stream_result.platform,
         })
+    except DeepResearchUnavailableError as exc:
+        # Actionable message (which model to add) instead of the generic error.
+        logger.warning(f"[AgentGateway] Deep Research unavailable for {session_id}: {exc}")
+        await ws_manager.send_error_and_close(session_id, str(exc))
     except Exception as exc:
         logger.error(f"[AgentGateway] WS chat failed for {session_id}: {exc}", exc_info=True)
         await ws_manager.send_error_and_close(session_id, "Generation failed")  # req 2.6

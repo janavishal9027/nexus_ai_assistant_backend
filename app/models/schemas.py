@@ -17,6 +17,9 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     history: Optional[list[MessageDto]] = None
+    # Deep Research / adaptive mode: route ONLY to large (>=400B parameter)
+    # models and always gather live web context for a thorough, cited answer.
+    deep_research: bool = False
 
 
 class ChatResponse(BaseModel):
@@ -83,6 +86,11 @@ class AuthResponse(BaseModel):
 class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
+
+
+class UpdateProfileRequest(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
 
 
 # ─── Full-Stack Agent Orchestration schemas (additive) ──────────────────────

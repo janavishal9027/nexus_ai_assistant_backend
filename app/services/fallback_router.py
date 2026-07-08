@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 import json
@@ -15,6 +17,15 @@ from . import request_context
 logger = logging.getLogger(__name__)
 
 _config_path = Path(__file__).parent.parent / "providers_config.json"
+
+# Hard wall-clock cap on how long the router spends trying models before giving
+# up. Bounds worst-case latency when many models fail (bad key, quota, non-chat
+# models). The good case (a working model early) is unaffected.
+OVERALL_BUDGET_S = 20.0
+
+# After this many quota/rate-limit (429) errors from one provider in a single
+# request, treat it as a project-level limit and stop trying that provider.
+_PLATFORM_429_LIMIT = 3
 
 
 def _get_max_retries() -> int:
@@ -86,6 +97,8 @@ _SIMPLE_GREETINGS = {
 _NON_CHAT_HINTS = (
     "image", "embed", "embedding", "rerank", "moderation", "tts", "whisper",
     "audio", "speech", "stable-diffusion", "sdxl", "flux", "dall-e", "video",
+    # Google (and others) non-text families that error out on chat completions.
+    "imagen", "veo", "lyria", "music", "gemini-embedding", "text-embedding", "aqa",
 )
 
 
@@ -124,14 +137,73 @@ def _is_chatty(model: ChatModel) -> bool:
     return not any(h in text for h in _NON_CHAT_HINTS)
 
 
+# ─── Deep Research: large-model (>=400B parameter) gating ────────────────────
+# Minimum parameter count (in billions) a model must have to be used in Deep
+# Research mode. Anything below this is excluded from that mode entirely.
+_MIN_DEEP_RESEARCH_B = 400.0
+
+# Parameter counts (billions) for big models whose size isn't in the name
+# (closed or oddly-named). Only consulted when no explicit "<n>b" token is
+# present, so distilled variants like "deepseek-r1-distill-llama-70b" are still
+# read as 70B (from the explicit token) rather than the base model's size.
+_KNOWN_PARAMS_B = {
+    "deepseek-v3": 671, "deepseek-r1": 671, "deepseek-chat": 671,
+    "deepseek-reasoner": 671, "deepseek-v3.1": 671, "deepseek-v3.2": 671,
+    "kimi-k2": 1000,
+    "llama-4-maverick": 400, "llama-4-behemoth": 2000,
+}
+
+import re as _re
+_PARAM_RE = _re.compile(r"(\d+(?:\.\d+)?)\s*b\b")
+
+
+def _param_billions(model: ChatModel) -> float | None:
+    """Best-effort parameter count (in billions) for a model, or None if the
+    size can't be determined. Prefers an explicit '<n>b' token in the id/name;
+    falls back to a small known-map for closed/oddly-named big models."""
+    text = f"{model.model_id} {model.display_name or ''}".lower()
+    best: float | None = None
+    for m in _PARAM_RE.finditer(text):
+        try:
+            v = float(m.group(1))
+        except ValueError:
+            continue
+        if best is None or v > best:
+            best = v
+    if best is not None:
+        return best
+    for key, b in _KNOWN_PARAMS_B.items():
+        if key in text:
+            return float(b)
+    return None
+
+
+def _is_deep_research_model(model: ChatModel) -> bool:
+    """True only for large (>=400B parameter) chat models — the tier Deep
+    Research mode is allowed to use."""
+    if not _is_chatty(model):
+        return False
+    b = _param_billions(model)
+    return b is not None and b >= _MIN_DEEP_RESEARCH_B
+
+
+class DeepResearchUnavailableError(RuntimeError):
+    """Raised when Deep Research mode is requested but no >=400B model is
+    available with the current keys. Carries a user-facing, actionable message."""
+
+
 def _get_ordered_models(
     db: Session,
     requested_model: str | None,
     messages: list[MessageDto] | None = None,
+    deep_research: bool = False,
 ) -> list[ChatModel]:
     """Get models to try, in order. A specific requested model goes first;
     otherwise ("auto") pick the tier that matches the request's complexity and
-    fall back to the nearest tiers. Only models from platforms with active keys."""
+    fall back to the nearest tiers. Only models from platforms with active keys.
+
+    When deep_research is True, restrict the pool to large (>=400B parameter)
+    models and order them biggest-first, ignoring the requested model/tier."""
     # Get platforms with active keys
     active_platforms = set(
         row[0] for row in
@@ -147,18 +219,34 @@ def _get_ordered_models(
         .all()
     )
 
+    if deep_research:
+        # Only >=400B models, ordered by parameter count (largest first) then
+        # priority. Requested model / complexity tier are intentionally ignored.
+        big = [m for m in models if _is_deep_research_model(m)]
+        big.sort(key=lambda m: (-(_param_billions(m) or 0), m.priority))
+        if big:
+            logger.info(
+                f"[Router] Deep Research → {len(big)} model(s) >= "
+                f"{_MIN_DEEP_RESEARCH_B:.0f}B; top pick: {big[0].display_name} "
+                f"(~{_param_billions(big[0]):.0f}B)"
+            )
+        else:
+            logger.warning("[Router] Deep Research requested but no >=400B model is available")
+        return big
+
     if requested_model and requested_model.lower() != "auto":
         ordered = []
         rest = []
         for m in models:
             if m.model_id == requested_model:
                 ordered.append(m)
-            else:
+            elif _is_chatty(m):  # non-chat models are dead-ends for chat fallback
                 rest.append(m)
         return ordered + rest
 
-    # AUTO: choose a tier from the request complexity, prefer real chat models,
-    # then order by distance from the desired tier (nearest tiers are fallbacks).
+    # AUTO: exclude non-chat models entirely (trying an image/audio/embedding
+    # model for chat wastes a full round-trip each), then order by tier proximity.
+    models = [m for m in models if _is_chatty(m)]
     desired = _estimate_tier(messages) if messages else "Large"
     target = _TIER_LEVEL.get(desired, 2)
     models = sorted(
@@ -184,18 +272,31 @@ async def route_chat(
     temperature: float | None = None,
     max_tokens: int | None = None,
     max_retries: int | None = None,
+    deep_research: bool = False,
 ) -> RouteResult:
     """Route a chat request with automatic fallback across models and keys."""
     if max_retries is None:
         max_retries = _get_max_retries()
-    models = _get_ordered_models(db, requested_model, messages)
+    models = _get_ordered_models(db, requested_model, messages, deep_research=deep_research)
+    if deep_research and not models:
+        raise DeepResearchUnavailableError(
+            "Deep Research needs a large model (400B+ parameters), but none are "
+            "available with your current keys. Add a provider that offers one — "
+            "e.g. NVIDIA NIM (Llama-3.1-405B or DeepSeek-R1) — then try again."
+        )
     skip_keys: set[str] = set()
     skip_models: set[int] = set()
+    skip_platforms: set[str] = set()   # providers whose key failed auth or hit quota
+    platform_429: dict[str, int] = {}  # per-provider 429 count this request
     last_error: Exception | None = None
+    deadline = time.monotonic() + OVERALL_BUDGET_S
 
     for attempt in range(max_retries):
         for model in models:
-            if model.id in skip_models:
+            if time.monotonic() > deadline:
+                logger.warning(f"[Router] Overall {OVERALL_BUDGET_S:.0f}s budget exceeded; stopping fallback")
+                break  # wall-clock budget exhausted; stop trying more models
+            if model.id in skip_models or model.platform in skip_platforms:
                 continue
 
             provider = provider_registry.get(model.platform)
@@ -262,7 +363,32 @@ async def route_chat(
                         rate_limit.record_rate_limit_hit(model.platform, model.model_id, key.id)
 
                         msg = str(e).lower()
-                        if "404" in msg or "not found" in msg or "403" in msg:
+                        # Auth failure → skip the whole provider (its key is bad),
+                        # not just this one model, so we don't waste a round-trip on
+                        # every other model behind the same failing key.
+                        if any(t in msg for t in (
+                            "401", "403", "unauthorized", "forbidden",
+                            "permission", "invalid api key", "authentication",
+                        )):
+                            skip_platforms.add(model.platform)
+                            skip_models.add(model.id)
+                            break
+                        # Repeated quota/rate-limit from a provider → treat as a
+                        # project-level limit and skip the rest of that provider.
+                        if any(t in msg for t in (
+                            "429", "quota", "rate limit", "rate-limit",
+                            "resource_exhausted", "too many requests",
+                        )):
+                            platform_429[model.platform] = platform_429.get(model.platform, 0) + 1
+                            # Abandon the whole provider on repeated 429s only if
+                            # there's another provider to fall back to; if it's the
+                            # only one, keep trying its models (some may have quota).
+                            other_platforms = {m.platform for m in models} - skip_platforms - {model.platform}
+                            if platform_429[model.platform] >= _PLATFORM_429_LIMIT and other_platforms:
+                                skip_platforms.add(model.platform)
+                            skip_models.add(model.id)
+                            break
+                        if "404" in msg or "not found" in msg:
                             skip_models.add(model.id)
                             break
                     else:
@@ -282,18 +408,31 @@ async def route_stream_chat(
     temperature: float | None = None,
     max_tokens: int | None = None,
     max_retries: int | None = None,
+    deep_research: bool = False,
 ) -> StreamRouteResult:
     """Route a streaming chat request with fallback."""
     if max_retries is None:
         max_retries = _get_max_retries()
-    models = _get_ordered_models(db, requested_model, messages)
+    models = _get_ordered_models(db, requested_model, messages, deep_research=deep_research)
+    if deep_research and not models:
+        raise DeepResearchUnavailableError(
+            "Deep Research needs a large model (400B+ parameters), but none are "
+            "available with your current keys. Add a provider that offers one — "
+            "e.g. NVIDIA NIM (Llama-3.1-405B or DeepSeek-R1) — then try again."
+        )
     skip_keys: set[str] = set()
     skip_models: set[int] = set()
+    skip_platforms: set[str] = set()   # providers whose key failed auth or hit quota
+    platform_429: dict[str, int] = {}  # per-provider 429 count this request
     last_error: Exception | None = None
+    deadline = time.monotonic() + OVERALL_BUDGET_S
 
     for attempt in range(max_retries):
         for model in models:
-            if model.id in skip_models:
+            if time.monotonic() > deadline:
+                logger.warning(f"[Router] Overall {OVERALL_BUDGET_S:.0f}s budget exceeded; stopping fallback")
+                break  # wall-clock budget exhausted; stop trying more models
+            if model.id in skip_models or model.platform in skip_platforms:
                 continue
 
             provider = provider_registry.get(model.platform)
@@ -371,7 +510,32 @@ async def route_stream_chat(
                         rate_limit.set_cooldown(model.platform, model.model_id, key.id)
                         rate_limit.record_rate_limit_hit(model.platform, model.model_id, key.id)
                         msg = str(e).lower()
-                        if "404" in msg or "not found" in msg or "403" in msg:
+                        # Auth failure → skip the whole provider (its key is bad),
+                        # not just this one model, so we don't waste a round-trip on
+                        # every other model behind the same failing key.
+                        if any(t in msg for t in (
+                            "401", "403", "unauthorized", "forbidden",
+                            "permission", "invalid api key", "authentication",
+                        )):
+                            skip_platforms.add(model.platform)
+                            skip_models.add(model.id)
+                            break
+                        # Repeated quota/rate-limit from a provider → treat as a
+                        # project-level limit and skip the rest of that provider.
+                        if any(t in msg for t in (
+                            "429", "quota", "rate limit", "rate-limit",
+                            "resource_exhausted", "too many requests",
+                        )):
+                            platform_429[model.platform] = platform_429.get(model.platform, 0) + 1
+                            # Abandon the whole provider on repeated 429s only if
+                            # there's another provider to fall back to; if it's the
+                            # only one, keep trying its models (some may have quota).
+                            other_platforms = {m.platform for m in models} - skip_platforms - {model.platform}
+                            if platform_429[model.platform] >= _PLATFORM_429_LIMIT and other_platforms:
+                                skip_platforms.add(model.platform)
+                            skip_models.add(model.id)
+                            break
+                        if "404" in msg or "not found" in msg:
                             skip_models.add(model.id)
                             break
                     else:
@@ -379,3 +543,203 @@ async def route_stream_chat(
                         break
 
     raise RuntimeError(f"All models exhausted for streaming. Last error: {last_error}")
+
+
+# ─── Deep Research: multi-model auto-continuation orchestrator ───────────────
+# Hard caps so a runaway build can't loop forever or blow the wall clock.
+DEEP_RESEARCH_MAX_ITERS = 12        # max model calls stitched into one answer
+DEEP_RESEARCH_BUDGET_S = 240.0      # wall-clock cap for a full multi-model build
+_DR_CONTEXT_CHARS = 80000           # tail of prior work handed to the next model
+_DR_STALL_TIMEOUT_S = 30.0          # no token for this long → model is "stuck", switch
+
+
+def _dr_continue_messages(base_messages: list[MessageDto], accumulated: str) -> list[MessageDto]:
+    """Messages for a continuation segment: the base request, the work produced
+    so far (so the next model can analyze it), and an instruction to resume
+    exactly where it stopped without repeating anything."""
+    if not accumulated:
+        return list(base_messages)
+    ctx = accumulated if len(accumulated) <= _DR_CONTEXT_CHARS else accumulated[-_DR_CONTEXT_CHARS:]
+    resume = MessageDto(role="user", content=(
+        "The assistant response above is your work so far but it was cut off. "
+        "Continue the implementation EXACTLY where it stopped. Do NOT repeat, "
+        "re-list, or restate any file or code already produced above; if you were "
+        "in the middle of a file, resume from the exact point (even mid-line). "
+        "Keep the same project structure and file-path headers, and keep going "
+        "until the entire project is fully implemented."
+    ))
+    return list(base_messages) + [
+        MessageDto(role="assistant", content=ctx),
+        resume,
+    ]
+
+
+def _dr_footer(models_used: list[str]) -> str:
+    """Trailing note listing every model that contributed to the answer."""
+    if not models_used:
+        return ""
+    if len(models_used) == 1:
+        return f"\n\n---\n*🔬 Deep Research · generated by **{models_used[0]}***"
+    chain = " → ".join(models_used)
+    return (f"\n\n---\n*🔬 Deep Research · assembled across "
+            f"**{len(models_used)} models**: {chain}*")
+
+
+async def route_deep_research_stream(
+    db: Session,
+    messages: list[MessageDto],
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> StreamRouteResult:
+    """Stream a Deep Research answer, auto-continuing across large (>=400B)
+    models so the user never has to type "continue".
+
+    A single model keeps going while it only hits the token cap (finish_reason
+    "length"); when a model rate-limits or errors, the next eligible model
+    analyzes the work so far and resumes it. The answer ends with a footer
+    listing every model that contributed."""
+    models = _get_ordered_models(db, None, messages, deep_research=True)
+    if not models:
+        raise DeepResearchUnavailableError(
+            "Deep Research needs a large model (400B+ parameters), but none are "
+            "available with your current keys. Add a provider that offers one — "
+            "e.g. NVIDIA NIM (Llama-3.1-405B or DeepSeek-R1) — then try again."
+        )
+
+    async def _gen() -> AsyncGenerator[str, None]:
+        accumulated = ""
+        models_used: list[str] = []
+        skip_platforms: set[str] = set()
+        skip_model_ids: set[int] = set()
+        idx = 0
+        iters = 0
+        deadline = time.monotonic() + DEEP_RESEARCH_BUDGET_S
+
+        while iters < DEEP_RESEARCH_MAX_ITERS and time.monotonic() < deadline:
+            iters += 1
+
+            # Find the next usable model (with a live, non-cooled key) from idx.
+            model = provider = key = None
+            while idx < len(models):
+                cand = models[idx]
+                if cand.platform in skip_platforms or cand.id in skip_model_ids:
+                    idx += 1
+                    continue
+                cand_provider = provider_registry.get(cand.platform)
+                if cand_provider is None:
+                    skip_model_ids.add(cand.id)
+                    idx += 1
+                    continue
+                keys = _apply_owner_scope(
+                    db.query(ApiKey).filter(
+                        ApiKey.platform == cand.platform,
+                        ApiKey.enabled == True,
+                        ApiKey.status != "error",
+                    )
+                ).all()
+                cand_key = next(
+                    (k for k in keys
+                     if not rate_limit.is_on_cooldown(cand.platform, cand.model_id, k.id)),
+                    None,
+                )
+                if cand_key is None:
+                    skip_model_ids.add(cand.id)
+                    idx += 1
+                    continue
+                model, provider, key = cand, cand_provider, cand_key
+                break
+
+            if model is None:
+                break  # no more usable large models
+
+            # Announce a genuine hand-off so the user sees the relay (and so the
+            # frontend's inter-event timeout keeps getting fed during the switch).
+            if accumulated and models_used and model.display_name != models_used[-1]:
+                yield f"\n\n> ↻ *Continuing with **{model.display_name}**…*\n\n"
+
+            seg_msgs = _dr_continue_messages(messages, accumulated)
+            produced = ""
+            finish_reason: str | None = None
+            try:
+                logger.info(f"[DeepResearch] Segment {iters}: {model.display_name} ({model.platform})")
+                agen = provider.stream_chat_completion_ex(
+                    api_key=key.api_key,
+                    messages=seg_msgs,
+                    model_id=model.model_id,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ).__aiter__()
+                try:
+                    while True:
+                        # Bound each token wait so a hung/"stuck" model (open
+                        # connection, no output) hands off instead of blocking.
+                        try:
+                            ev = await asyncio.wait_for(
+                                agen.__anext__(), timeout=_DR_STALL_TIMEOUT_S)
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            raise RuntimeError(
+                                f"{model.display_name} stalled — no output for "
+                                f"{_DR_STALL_TIMEOUT_S:.0f}s")
+                        if ev.get("type") == "content":
+                            text = ev.get("text", "")
+                            if text:
+                                produced += text
+                                accumulated += text
+                                yield text
+                        elif ev.get("type") == "finish":
+                            finish_reason = ev.get("reason")
+                finally:
+                    try:
+                        await agen.aclose()
+                    except Exception:
+                        pass
+                rate_limit.record_success(model.platform, model.model_id, key.id)
+            except Exception as e:
+                logger.warning(f"[DeepResearch] {model.display_name} error: {e}")
+                if rate_limit.is_retryable_error(e):
+                    rate_limit.set_cooldown(model.platform, model.model_id, key.id)
+                    rate_limit.record_rate_limit_hit(model.platform, model.model_id, key.id)
+                    if any(t in str(e).lower() for t in (
+                        "401", "403", "unauthorized", "forbidden",
+                        "permission", "invalid api key", "authentication",
+                    )):
+                        skip_platforms.add(model.platform)
+                # Hand off to the next model; any partial text already streamed
+                # stays in `accumulated`, so the next model resumes from it.
+                skip_model_ids.add(model.id)
+                idx += 1
+                continue
+
+            if produced.strip():
+                if not models_used or models_used[-1] != model.display_name:
+                    models_used.append(model.display_name)
+            else:
+                # Nothing produced and no error → drop this model, try the next.
+                skip_model_ids.add(model.id)
+                idx += 1
+                continue
+
+            if finish_reason == "length":
+                # Truncated: same healthy model keeps going (most coherent).
+                continue
+            # Natural stop (or unknown reason) → the project is complete.
+            break
+
+        if models_used:
+            yield _dr_footer(models_used)
+        elif not accumulated.strip():
+            yield (
+                "I couldn't generate a Deep Research response right now — every "
+                "large (400B+) model was unavailable or rate-limited. Please try again shortly."
+            )
+
+    first = models[0]
+    return StreamRouteResult(
+        stream=_gen(),
+        model_id=first.model_id,
+        platform=first.platform,
+        display_name="Deep Research",
+        attempts=0,
+    )

@@ -18,7 +18,10 @@ from sqlalchemy.orm import Session
 
 from ..models.schemas import MessageDto, ChatRequest
 from ..models.db_models import Conversation, Message
-from .fallback_router import route_chat, route_stream_chat, RouteResult, StreamRouteResult
+from .fallback_router import (
+    route_chat, route_stream_chat, route_deep_research_stream,
+    RouteResult, StreamRouteResult, DeepResearchUnavailableError,
+)
 from .web_search import needs_web_search, web_search
 from datetime import datetime, timezone
 
@@ -51,6 +54,34 @@ else:
 # Tool failure tracking for monitoring (requirement 10.8)
 _tool_success_counts: dict[str, int] = {}
 _tool_failure_counts: dict[str, int] = {}
+
+
+# Fast pre-gate for the LLM-backed tool-decision loop. Ordinary chat/coding/
+# writing prompts never need a tool, so invoking the DecisionEngine on every
+# message adds a full LLM round-trip *before* the answer even starts. We only
+# enter the loop when the message explicitly signals a tool need. Real-time
+# questions are handled separately (and faster) by the web-search heuristic,
+# which injects results straight into the prompt — so when that already fired
+# (web_context is set) the loop is skipped too.
+_TOOL_INTENT_SIGNALS = (
+    "search the web", "search online", "web search", "look up", "look it up",
+    "find online", "browse the", "on the internet", "google it",
+    "my task", "my tasks", "list task", "list tasks", "create a task",
+    "create task", "complete task", "mark task", "task list", "assign task",
+    "list user", "create user", "find user", "update user", "user record",
+    "query the database", "run a query", "sql query", "from the database",
+    "remember that", "what did i say", "earlier i said", "recall the",
+    "recent events", "live events", "current state of my",
+)
+
+
+def _should_run_tool_loop(message: str, web_context: str | None) -> bool:
+    """True only when the message plausibly needs a tool. Skips the per-message
+    DecisionEngine LLM call for ordinary prompts — the main time-to-first-token win."""
+    if web_context:  # real-time data already injected by the web-search heuristic
+        return False
+    q = (message or "").lower()
+    return any(sig in q for sig in _TOOL_INTENT_SIGNALS)
 
 
 def get_tool_failure_rates() -> dict[str, dict]:
@@ -468,6 +499,7 @@ def _build_agent_messages(
     user_message: str,
     history: list[MessageDto] | None = None,
     web_context: str | None = None,
+    deep_research: bool = False,
 ) -> list[MessageDto]:
     """Build the message list with system prompt and context window trimming."""
     config = get_config()
@@ -478,6 +510,23 @@ def _build_agent_messages(
     # Always give the model the real current date (it can't know it otherwise).
     today = datetime.now().strftime("%A, %B %d, %Y")
     system_prompt = f"{system_prompt}\n\nToday's date is {today}."
+
+    # Deep Research mode: instruct the (large) model to produce a thorough,
+    # structured, well-sourced answer rather than a quick reply.
+    if deep_research:
+        system_prompt += (
+            "\n\n=== DEEP RESEARCH MODE ===\n"
+            "You are operating as a deep-research analyst using a large, highly "
+            "capable model. Produce a comprehensive, well-structured answer:\n"
+            "• Break the topic into clear sections with headings.\n"
+            "• Reason step by step and consider multiple perspectives / trade-offs.\n"
+            "• Ground claims in the live web results when provided and cite sources "
+            "with their URLs.\n"
+            "• Distinguish established facts from uncertainty, and note gaps or "
+            "conflicting evidence.\n"
+            "• End with a concise takeaway or set of recommendations.\n"
+            "Be rigorous and adaptive to the depth the question demands."
+        )
 
     # Inject live web results for real-time questions.
     if web_context:
@@ -549,12 +598,14 @@ async def agent_chat(db: Session, request: ChatRequest, owner_id: int | None = N
     )
 
     # Build agent-managed messages
-    # Real-time web search when the question likely needs current data.
+    # Real-time web search when the question likely needs current data. Deep
+    # Research always gathers live context (it doesn't wait for the heuristic).
+    deep_research = bool(getattr(request, "deep_research", False))
     web_context = None
     web_search_enabled = agent_cfg.get("web_search_enabled", True)
-    should_search = needs_web_search(request.message)
-    logger.info(f"[Agent/Debug] web_search_enabled={web_search_enabled}, should_search={should_search}, query='{request.message[:60]}'")
-    
+    should_search = deep_research or needs_web_search(request.message)
+    logger.info(f"[Agent/Debug] web_search_enabled={web_search_enabled}, should_search={should_search}, deep_research={deep_research}, query='{request.message[:60]}'")
+
     if web_search_enabled and should_search:
         logger.info(f"[Agent] Triggering web search for: {request.message[:60]}")
         web_context = await web_search(request.message)
@@ -564,7 +615,8 @@ async def agent_chat(db: Session, request: ChatRequest, owner_id: int | None = N
             logger.warning(f"[Agent] Web search returned no results")
 
     messages = _build_agent_messages(
-        db, conversation_id, request.message, request.history, web_context
+        db, conversation_id, request.message, request.history, web_context,
+        deep_research=deep_research,
     )
 
     # --- New tool orchestration loop ---
@@ -575,7 +627,7 @@ async def agent_chat(db: Session, request: ChatRequest, owner_id: int | None = N
     tool_rounds_executed = 0
     citation_tracker = CitationTracker() if _tool_system_available else None
 
-    if tool_calling_enabled and _tool_system_available:
+    if tool_calling_enabled and _tool_system_available and _should_run_tool_loop(request.message, web_context):
         logger.info(
             f"[Agent] Tool orchestration enabled, max_rounds={max_rounds}, "
             f"max_concurrent={max_concurrent}, conversation_id={conversation_id}, "
@@ -706,21 +758,31 @@ async def agent_chat(db: Session, request: ChatRequest, owner_id: int | None = N
             messages=messages,
             requested_model=request.model,
             temperature=request.temperature or agent_cfg.get("default_temperature"),
-            max_tokens=request.max_tokens or agent_cfg.get("default_max_tokens"),
+            max_tokens=request.max_tokens or (8192 if deep_research
+                                              else agent_cfg.get("default_max_tokens")),
+            deep_research=deep_research,
         )
 
         # Append citations to content if any sources were found
         citations_text = ""
         if citation_tracker:
             citations_text = citation_tracker.format_citations()
-        
+
         final_content = result.content + (f"\n\n{citations_text}" if citations_text else "")
-        
+
         model_used = result.model_id
         platform_used = result.platform
         fallback_attempts = result.attempts
         display_name = result.display_name
-        
+
+    except DeepResearchUnavailableError as e:
+        # Surface the actionable guidance (which model to add) to the user.
+        logger.warning(f"[Agent] Deep Research unavailable: {e}")
+        final_content = str(e)
+        model_used = "deep-research-unavailable"
+        platform_used = "none"
+        fallback_attempts = 0
+        display_name = "Deep Research"
     except Exception as e:
         # Absolute fallback: never expose internal errors to user (requirement 10.3, 10.4)
         logger.error(f"[Agent] Final response generation failed: {e}", exc_info=True)
@@ -795,12 +857,14 @@ async def agent_stream_chat(db: Session, request: ChatRequest, on_tool_event=Non
         f"correlation_id={correlation_id}"
     )
 
-    # Real-time web search when the question likely needs current data.
+    # Real-time web search when the question likely needs current data. Deep
+    # Research always gathers live context (it doesn't wait for the heuristic).
+    deep_research = bool(getattr(request, "deep_research", False))
     web_context = None
     web_search_enabled = agent_cfg.get("web_search_enabled", True)
-    should_search = needs_web_search(request.message)
-    logger.info(f"[Agent/Stream/Debug] web_search_enabled={web_search_enabled}, should_search={should_search}, query='{request.message[:60]}'")
-    
+    should_search = deep_research or needs_web_search(request.message)
+    logger.info(f"[Agent/Stream/Debug] web_search_enabled={web_search_enabled}, should_search={should_search}, deep_research={deep_research}, query='{request.message[:60]}'")
+
     if web_search_enabled and should_search:
         logger.info(f"[Agent/Stream] Triggering web search for: {request.message[:60]}")
         web_context = await web_search(request.message)
@@ -810,7 +874,8 @@ async def agent_stream_chat(db: Session, request: ChatRequest, on_tool_event=Non
             logger.warning(f"[Agent/Stream] Web search returned no results")
 
     messages = _build_agent_messages(
-        db, conversation_id, request.message, request.history, web_context
+        db, conversation_id, request.message, request.history, web_context,
+        deep_research=deep_research,
     )
 
     # --- Tool orchestration loop (runs in non-streaming mode before streaming begins) ---
@@ -821,7 +886,7 @@ async def agent_stream_chat(db: Session, request: ChatRequest, on_tool_event=Non
     tool_rounds_executed = 0
     citation_tracker = CitationTracker() if _tool_system_available else None
 
-    if tool_calling_enabled and _tool_system_available:
+    if tool_calling_enabled and _tool_system_available and _should_run_tool_loop(request.message, web_context):
         logger.info(
             f"[Agent/Stream] Tool orchestration enabled, max_rounds={max_rounds}, "
             f"max_concurrent={max_concurrent}, conversation_id={conversation_id}, "
@@ -937,13 +1002,23 @@ async def agent_stream_chat(db: Session, request: ChatRequest, on_tool_event=Non
 
     # --- Final streaming response generation (uses existing Fallback Router) ---
     try:
-        result: StreamRouteResult = await route_stream_chat(
-            db=db,
-            messages=messages,
-            requested_model=request.model,
-            temperature=request.temperature or agent_cfg.get("default_temperature"),
-            max_tokens=request.max_tokens or agent_cfg.get("default_max_tokens"),
-        )
+        if deep_research:
+            # Deep Research: auto-continue across large (>=400B) models so the
+            # user never has to type "continue"; ends with a models-used footer.
+            result: StreamRouteResult = await route_deep_research_stream(
+                db=db,
+                messages=messages,
+                temperature=request.temperature or agent_cfg.get("default_temperature"),
+                max_tokens=request.max_tokens or 8192,
+            )
+        else:
+            result: StreamRouteResult = await route_stream_chat(
+                db=db,
+                messages=messages,
+                requested_model=request.model,
+                temperature=request.temperature or agent_cfg.get("default_temperature"),
+                max_tokens=request.max_tokens or agent_cfg.get("default_max_tokens"),
+            )
     except asyncio.CancelledError:
         logger.warning(f"[Agent/Stream] Streaming response generation cancelled (client disconnect)")
         raise  # Re-raise to propagate cancellation
