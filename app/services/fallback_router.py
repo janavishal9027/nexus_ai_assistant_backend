@@ -585,6 +585,158 @@ def _dr_footer(models_used: list[str]) -> str:
             f"**{len(models_used)} models**: {chain}*")
 
 
+_DR_EMPTY_MSG = (
+    "I couldn't generate a Deep Research response right now — every "
+    "large (400B+) model was unavailable or rate-limited. Please try again shortly."
+)
+
+
+async def _deep_research_relay(
+    db: Session,
+    models: list[ChatModel],
+    messages: list[MessageDto],
+    temperature: float | None,
+    max_tokens: int | None,
+) -> AsyncGenerator[dict, None]:
+    """Core multi-model continuation used by BOTH the streaming and non-streaming
+    Deep Research entry points, so the relay behaves identically either way.
+
+    A single model keeps going while it only hits the token cap (finish_reason
+    "length"); when a model rate-limits, stalls, or errors, the next eligible
+    model receives the work so far and resumes exactly where it stopped. Yields
+    dict events so each caller can render them as it likes:
+
+      {"type": "handoff", "model": <display_name>}  — about to switch models
+      {"type": "content", "text": <str>}            — a token delta
+      {"type": "done", "models_used": [...], "produced_any": <bool>}  — final
+    """
+    accumulated = ""
+    models_used: list[str] = []
+    skip_platforms: set[str] = set()
+    skip_model_ids: set[int] = set()
+    idx = 0
+    iters = 0
+    deadline = time.monotonic() + DEEP_RESEARCH_BUDGET_S
+
+    while iters < DEEP_RESEARCH_MAX_ITERS and time.monotonic() < deadline:
+        iters += 1
+
+        # Find the next usable model (with a live, non-cooled key) from idx.
+        model = provider = key = None
+        while idx < len(models):
+            cand = models[idx]
+            if cand.platform in skip_platforms or cand.id in skip_model_ids:
+                idx += 1
+                continue
+            cand_provider = provider_registry.get(cand.platform)
+            if cand_provider is None:
+                skip_model_ids.add(cand.id)
+                idx += 1
+                continue
+            keys = _apply_owner_scope(
+                db.query(ApiKey).filter(
+                    ApiKey.platform == cand.platform,
+                    ApiKey.enabled == True,
+                    ApiKey.status != "error",
+                )
+            ).all()
+            cand_key = next(
+                (k for k in keys
+                 if not rate_limit.is_on_cooldown(cand.platform, cand.model_id, k.id)),
+                None,
+            )
+            if cand_key is None:
+                skip_model_ids.add(cand.id)
+                idx += 1
+                continue
+            model, provider, key = cand, cand_provider, cand_key
+            break
+
+        if model is None:
+            break  # no more usable large models
+
+        # Announce a genuine hand-off so callers can show the relay (and so the
+        # frontend's inter-event timeout keeps getting fed during the switch).
+        if accumulated and models_used and model.display_name != models_used[-1]:
+            yield {"type": "handoff", "model": model.display_name}
+
+        seg_msgs = _dr_continue_messages(messages, accumulated)
+        produced = ""
+        finish_reason: str | None = None
+        try:
+            logger.info(f"[DeepResearch] Segment {iters}: {model.display_name} ({model.platform})")
+            agen = provider.stream_chat_completion_ex(
+                api_key=key.api_key,
+                messages=seg_msgs,
+                model_id=model.model_id,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ).__aiter__()
+            try:
+                while True:
+                    # Bound each token wait so a hung/"stuck" model (open
+                    # connection, no output) hands off instead of blocking.
+                    try:
+                        ev = await asyncio.wait_for(
+                            agen.__anext__(), timeout=_DR_STALL_TIMEOUT_S)
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError:
+                        raise RuntimeError(
+                            f"{model.display_name} stalled — no output for "
+                            f"{_DR_STALL_TIMEOUT_S:.0f}s")
+                    if ev.get("type") == "content":
+                        text = ev.get("text", "")
+                        if text:
+                            produced += text
+                            accumulated += text
+                            yield {"type": "content", "text": text}
+                    elif ev.get("type") == "finish":
+                        finish_reason = ev.get("reason")
+            finally:
+                try:
+                    await agen.aclose()
+                except Exception:
+                    pass
+            rate_limit.record_success(model.platform, model.model_id, key.id)
+        except Exception as e:
+            logger.warning(f"[DeepResearch] {model.display_name} error: {e}")
+            if rate_limit.is_retryable_error(e):
+                rate_limit.set_cooldown(model.platform, model.model_id, key.id)
+                rate_limit.record_rate_limit_hit(model.platform, model.model_id, key.id)
+                if any(t in str(e).lower() for t in (
+                    "401", "403", "unauthorized", "forbidden",
+                    "permission", "invalid api key", "authentication",
+                )):
+                    skip_platforms.add(model.platform)
+            # Hand off to the next model; any partial text already produced stays
+            # in `accumulated`, so the next model resumes from it.
+            skip_model_ids.add(model.id)
+            idx += 1
+            continue
+
+        if produced.strip():
+            if not models_used or models_used[-1] != model.display_name:
+                models_used.append(model.display_name)
+        else:
+            # Nothing produced and no error → drop this model, try the next.
+            skip_model_ids.add(model.id)
+            idx += 1
+            continue
+
+        if finish_reason == "length":
+            # Truncated: same healthy model keeps going (most coherent).
+            continue
+        # Natural stop (or unknown reason) → the project is complete.
+        break
+
+    yield {
+        "type": "done",
+        "models_used": models_used,
+        "produced_any": bool(accumulated.strip()),
+    }
+
+
 async def route_deep_research_stream(
     db: Session,
     messages: list[MessageDto],
@@ -607,133 +759,17 @@ async def route_deep_research_stream(
         )
 
     async def _gen() -> AsyncGenerator[str, None]:
-        accumulated = ""
-        models_used: list[str] = []
-        skip_platforms: set[str] = set()
-        skip_model_ids: set[int] = set()
-        idx = 0
-        iters = 0
-        deadline = time.monotonic() + DEEP_RESEARCH_BUDGET_S
-
-        while iters < DEEP_RESEARCH_MAX_ITERS and time.monotonic() < deadline:
-            iters += 1
-
-            # Find the next usable model (with a live, non-cooled key) from idx.
-            model = provider = key = None
-            while idx < len(models):
-                cand = models[idx]
-                if cand.platform in skip_platforms or cand.id in skip_model_ids:
-                    idx += 1
-                    continue
-                cand_provider = provider_registry.get(cand.platform)
-                if cand_provider is None:
-                    skip_model_ids.add(cand.id)
-                    idx += 1
-                    continue
-                keys = _apply_owner_scope(
-                    db.query(ApiKey).filter(
-                        ApiKey.platform == cand.platform,
-                        ApiKey.enabled == True,
-                        ApiKey.status != "error",
-                    )
-                ).all()
-                cand_key = next(
-                    (k for k in keys
-                     if not rate_limit.is_on_cooldown(cand.platform, cand.model_id, k.id)),
-                    None,
-                )
-                if cand_key is None:
-                    skip_model_ids.add(cand.id)
-                    idx += 1
-                    continue
-                model, provider, key = cand, cand_provider, cand_key
-                break
-
-            if model is None:
-                break  # no more usable large models
-
-            # Announce a genuine hand-off so the user sees the relay (and so the
-            # frontend's inter-event timeout keeps getting fed during the switch).
-            if accumulated and models_used and model.display_name != models_used[-1]:
-                yield f"\n\n> ↻ *Continuing with **{model.display_name}**…*\n\n"
-
-            seg_msgs = _dr_continue_messages(messages, accumulated)
-            produced = ""
-            finish_reason: str | None = None
-            try:
-                logger.info(f"[DeepResearch] Segment {iters}: {model.display_name} ({model.platform})")
-                agen = provider.stream_chat_completion_ex(
-                    api_key=key.api_key,
-                    messages=seg_msgs,
-                    model_id=model.model_id,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                ).__aiter__()
-                try:
-                    while True:
-                        # Bound each token wait so a hung/"stuck" model (open
-                        # connection, no output) hands off instead of blocking.
-                        try:
-                            ev = await asyncio.wait_for(
-                                agen.__anext__(), timeout=_DR_STALL_TIMEOUT_S)
-                        except StopAsyncIteration:
-                            break
-                        except asyncio.TimeoutError:
-                            raise RuntimeError(
-                                f"{model.display_name} stalled — no output for "
-                                f"{_DR_STALL_TIMEOUT_S:.0f}s")
-                        if ev.get("type") == "content":
-                            text = ev.get("text", "")
-                            if text:
-                                produced += text
-                                accumulated += text
-                                yield text
-                        elif ev.get("type") == "finish":
-                            finish_reason = ev.get("reason")
-                finally:
-                    try:
-                        await agen.aclose()
-                    except Exception:
-                        pass
-                rate_limit.record_success(model.platform, model.model_id, key.id)
-            except Exception as e:
-                logger.warning(f"[DeepResearch] {model.display_name} error: {e}")
-                if rate_limit.is_retryable_error(e):
-                    rate_limit.set_cooldown(model.platform, model.model_id, key.id)
-                    rate_limit.record_rate_limit_hit(model.platform, model.model_id, key.id)
-                    if any(t in str(e).lower() for t in (
-                        "401", "403", "unauthorized", "forbidden",
-                        "permission", "invalid api key", "authentication",
-                    )):
-                        skip_platforms.add(model.platform)
-                # Hand off to the next model; any partial text already streamed
-                # stays in `accumulated`, so the next model resumes from it.
-                skip_model_ids.add(model.id)
-                idx += 1
-                continue
-
-            if produced.strip():
-                if not models_used or models_used[-1] != model.display_name:
-                    models_used.append(model.display_name)
-            else:
-                # Nothing produced and no error → drop this model, try the next.
-                skip_model_ids.add(model.id)
-                idx += 1
-                continue
-
-            if finish_reason == "length":
-                # Truncated: same healthy model keeps going (most coherent).
-                continue
-            # Natural stop (or unknown reason) → the project is complete.
-            break
-
-        if models_used:
-            yield _dr_footer(models_used)
-        elif not accumulated.strip():
-            yield (
-                "I couldn't generate a Deep Research response right now — every "
-                "large (400B+) model was unavailable or rate-limited. Please try again shortly."
-            )
+        async for ev in _deep_research_relay(db, models, messages, temperature, max_tokens):
+            kind = ev.get("type")
+            if kind == "content":
+                yield ev["text"]
+            elif kind == "handoff":
+                yield f"\n\n> ↻ *Continuing with **{ev['model']}**…*\n\n"
+            elif kind == "done":
+                if ev["models_used"]:
+                    yield _dr_footer(ev["models_used"])
+                elif not ev["produced_any"]:
+                    yield _DR_EMPTY_MSG
 
     first = models[0]
     return StreamRouteResult(
@@ -742,4 +778,49 @@ async def route_deep_research_stream(
         platform=first.platform,
         display_name="Deep Research",
         attempts=0,
+    )
+
+
+async def route_deep_research(
+    db: Session,
+    messages: list[MessageDto],
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> RouteResult:
+    """Non-streaming Deep Research: run the SAME multi-model relay to completion,
+    then return the fully assembled answer (with the models-used footer) as one
+    RouteResult. This is what makes non-streaming Deep Research requests continue
+    across models instead of stopping at the first model's token cap."""
+    models = _get_ordered_models(db, None, messages, deep_research=True)
+    if not models:
+        raise DeepResearchUnavailableError(
+            "Deep Research needs a large model (400B+ parameters), but none are "
+            "available with your current keys. Add a provider that offers one — "
+            "e.g. NVIDIA NIM (Llama-3.1-405B or DeepSeek-R1) — then try again."
+        )
+
+    parts: list[str] = []
+    models_used: list[str] = []
+    produced_any = False
+    async for ev in _deep_research_relay(db, models, messages, temperature, max_tokens):
+        kind = ev.get("type")
+        if kind == "content":
+            parts.append(ev["text"])
+        elif kind == "done":
+            models_used = ev["models_used"]
+            produced_any = ev["produced_any"]
+
+    content = "".join(parts)
+    if models_used:
+        content += _dr_footer(models_used)
+    elif not produced_any:
+        content = _DR_EMPTY_MSG
+
+    first = models[0]
+    return RouteResult(
+        content=content,
+        model_id=first.model_id,
+        platform=first.platform,
+        display_name="Deep Research",
+        attempts=len(models_used),
     )

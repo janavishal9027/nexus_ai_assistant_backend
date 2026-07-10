@@ -178,6 +178,7 @@ async def _handle_ws_chat(session_id: str, data: dict, owner_id: int | None = No
             conversation_id=conversation_id_in,
             model=data.get("model"),
             deep_research=bool(data.get("deep_research", False)),
+            web_search=bool(data.get("web_search", False)),
         )
         conversation_id, stream_result, citations = await agent_stream_chat(
             db, req, on_tool_event=on_tool_event, owner_id=owner_id)

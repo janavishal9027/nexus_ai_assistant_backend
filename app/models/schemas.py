@@ -20,6 +20,9 @@ class ChatRequest(BaseModel):
     # Deep Research / adaptive mode: route ONLY to large (>=400B parameter)
     # models and always gather live web context for a thorough, cited answer.
     deep_research: bool = False
+    # Web Search mode: force a live web search for this turn (bypasses the
+    # needs_web_search heuristic) so the answer is grounded in fresh results.
+    web_search: bool = False
 
 
 class ChatResponse(BaseModel):

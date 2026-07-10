@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from ..models.schemas import MessageDto, ChatRequest
 from ..models.db_models import Conversation, Message
 from .fallback_router import (
-    route_chat, route_stream_chat, route_deep_research_stream,
+    route_chat, route_stream_chat, route_deep_research, route_deep_research_stream,
     RouteResult, StreamRouteResult, DeepResearchUnavailableError,
 )
 from .web_search import needs_web_search, web_search
@@ -599,12 +599,14 @@ async def agent_chat(db: Session, request: ChatRequest, owner_id: int | None = N
 
     # Build agent-managed messages
     # Real-time web search when the question likely needs current data. Deep
-    # Research always gathers live context (it doesn't wait for the heuristic).
+    # Research always gathers live context (it doesn't wait for the heuristic);
+    # explicit Web Search mode also forces it regardless of the heuristic.
     deep_research = bool(getattr(request, "deep_research", False))
+    force_web_search = bool(getattr(request, "web_search", False))
     web_context = None
     web_search_enabled = agent_cfg.get("web_search_enabled", True)
-    should_search = deep_research or needs_web_search(request.message)
-    logger.info(f"[Agent/Debug] web_search_enabled={web_search_enabled}, should_search={should_search}, deep_research={deep_research}, query='{request.message[:60]}'")
+    should_search = deep_research or force_web_search or needs_web_search(request.message)
+    logger.info(f"[Agent/Debug] web_search_enabled={web_search_enabled}, should_search={should_search}, deep_research={deep_research}, force_web_search={force_web_search}, query='{request.message[:60]}'")
 
     if web_search_enabled and should_search:
         logger.info(f"[Agent] Triggering web search for: {request.message[:60]}")
@@ -753,15 +755,25 @@ async def agent_chat(db: Session, request: ChatRequest, owner_id: int | None = N
     # --- Final response generation (uses existing Fallback Router) ---
     # Guarantee response generation even if all previous steps failed (requirement 10.6)
     try:
-        result: RouteResult = await route_chat(
-            db=db,
-            messages=messages,
-            requested_model=request.model,
-            temperature=request.temperature or agent_cfg.get("default_temperature"),
-            max_tokens=request.max_tokens or (8192 if deep_research
-                                              else agent_cfg.get("default_max_tokens")),
-            deep_research=deep_research,
-        )
+        if deep_research:
+            # Deep Research: run the multi-model relay to completion so the answer
+            # auto-continues across large (>=400B) models (never asks the user to
+            # type "continue") and ends with a models-used footer — same behavior
+            # as the streaming path, just assembled into one response.
+            result: RouteResult = await route_deep_research(
+                db=db,
+                messages=messages,
+                temperature=request.temperature or agent_cfg.get("default_temperature"),
+                max_tokens=request.max_tokens or 8192,
+            )
+        else:
+            result: RouteResult = await route_chat(
+                db=db,
+                messages=messages,
+                requested_model=request.model,
+                temperature=request.temperature or agent_cfg.get("default_temperature"),
+                max_tokens=request.max_tokens or agent_cfg.get("default_max_tokens"),
+            )
 
         # Append citations to content if any sources were found
         citations_text = ""

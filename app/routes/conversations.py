@@ -96,6 +96,33 @@ def delete(conversation_id: int, db: Session = Depends(get_db),
     return {"success": True}
 
 
+class TruncateBody(BaseModel):
+    keep: int  # keep the first N messages (oldest first); delete the rest
+
+
+@router.post("/{conversation_id}/truncate")
+def truncate(conversation_id: int, body: TruncateBody, db: Session = Depends(get_db),
+             account: Account = Depends(get_current_account)):
+    """Delete all messages in a conversation beyond the first `keep` (ordered
+    oldest-first). Used when a user edits an earlier message: the old message and
+    everything after it are removed so the regenerated turn — and future reloads
+    — reflect the edit instead of duplicating history."""
+    _owned_or_404(db, conversation_id, account.id)
+    keep = max(0, body.keep)
+    messages = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation_id)
+        .order_by(Message.created_at.asc())
+        .all()
+    )
+    to_delete = messages[keep:]
+    for m in to_delete:
+        db.delete(m)
+    if to_delete:
+        db.commit()
+    return {"success": True, "deleted": len(to_delete)}
+
+
 class UpdateTitle(BaseModel):
     title: Optional[str] = None
 
