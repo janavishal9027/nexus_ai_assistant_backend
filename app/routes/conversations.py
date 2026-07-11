@@ -26,6 +26,8 @@ def get_all(db: Session = Depends(get_db), account: Account = Depends(get_curren
     conversations = (
         db.query(Conversation)
         .filter(Conversation.owner_id == account.id)
+        # Grounded Knowledge-Base chats live in the KB screen, not main history.
+        .filter(Conversation.knowledge_base_id.is_(None))
         .order_by(Conversation.updated_at.desc())
         .all()
     )

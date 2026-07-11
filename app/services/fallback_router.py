@@ -205,6 +205,7 @@ def _get_ordered_models(
     requested_model: str | None,
     messages: list[MessageDto] | None = None,
     deep_research: bool = False,
+    require_vision: bool = False,
 ) -> list[ChatModel]:
     """Get models to try, in order. A specific requested model goes first;
     otherwise ("auto") pick the tier that matches the request's complexity and
@@ -226,6 +227,29 @@ def _get_ordered_models(
         .order_by(ChatModel.priority.asc())
         .all()
     )
+
+    if require_vision:
+        # Images are attached → only vision-capable chat models can handle them.
+        # Honor a specific requested model only if it too supports vision.
+        vision = [m for m in models if m.supports_vision and _is_chatty(m)]
+        if requested_model and requested_model.lower() not in ("", "auto") \
+                and not requested_model.lower().startswith("auto:"):
+            first = [m for m in vision if m.model_id == requested_model]
+            rest = [m for m in vision if m.model_id != requested_model]
+            if first:
+                return first + rest
+        desired = _estimate_tier(messages) if messages else "Large"
+        target = _TIER_LEVEL.get(desired, 2)
+        vision.sort(key=lambda m: (abs(_TIER_LEVEL.get(m.size_label, 1) - target), m.priority))
+        if vision:
+            logger.info(
+                f"[Router] Vision required → {len(vision)} vision model(s); "
+                f"top pick: {vision[0].display_name}")
+        else:
+            logger.warning(
+                "[Router] Vision required but no vision-capable model is available "
+                "with the current keys")
+        return vision
 
     if deep_research:
         # Only >=400B models, ordered by parameter count (largest first) then
@@ -436,11 +460,13 @@ async def route_stream_chat(
     max_tokens: int | None = None,
     max_retries: int | None = None,
     deep_research: bool = False,
+    require_vision: bool = False,
 ) -> StreamRouteResult:
     """Route a streaming chat request with fallback."""
     if max_retries is None:
         max_retries = _get_max_retries()
-    models = _get_ordered_models(db, requested_model, messages, deep_research=deep_research)
+    models = _get_ordered_models(db, requested_model, messages,
+                                 deep_research=deep_research, require_vision=require_vision)
     if deep_research and not models:
         raise DeepResearchUnavailableError(
             "Deep Research needs a large model (400B+ parameters), but none are "

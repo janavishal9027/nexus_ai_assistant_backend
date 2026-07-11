@@ -184,13 +184,31 @@ class OpenAICompatProvider(LlmProvider):
         body: dict = {
             "model": model_id,
             "stream": stream,
-            "messages": [{"role": self._api_role(m.role), "content": m.content} for m in messages],
+            "messages": [
+                {"role": self._api_role(m.role), "content": self._content_for(m)}
+                for m in messages
+            ],
         }
         if temperature is not None:
             body["temperature"] = temperature
         if max_tokens and max_tokens > 0:
             body["max_tokens"] = max_tokens
         return body
+
+    @staticmethod
+    def _content_for(m: MessageDto):
+        """OpenAI-style message content. Plain string unless the turn carries
+        images, in which case a multimodal parts array (text + image_url) so a
+        vision model can see them."""
+        images = getattr(m, "images", None)
+        if not images:
+            return m.content
+        parts: list[dict] = []
+        if m.content:
+            parts.append({"type": "text", "text": m.content})
+        for url in images:
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+        return parts
 
     @staticmethod
     def _api_role(role: str) -> str:

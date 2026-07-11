@@ -48,6 +48,25 @@ class Settings(BaseSettings):
     # Token lifetime in hours (default 30 days).
     jwt_expires_hours: int = 720
 
+    # ─── RAG / Knowledge Base pipeline ──────────────────────────────────────
+    # Chunking: target size and overlap in characters (~4 chars per token, so
+    # ~1200 chars ≈ 300 tokens). Overlap preserves context across chunk edges.
+    rag_chunk_size: int = 1200
+    rag_chunk_overlap: int = 200
+    # Max upload size per document (bytes). Default 25 MB.
+    rag_max_upload_bytes: int = 25 * 1024 * 1024
+    # Hybrid retrieval fan-out and fusion (per the recommended sequence):
+    #   semantic top-N  +  keyword top-N  →  RRF  →  top-K  →  rerank → final
+    rag_semantic_top_n: int = 20
+    rag_keyword_top_n: int = 20
+    rag_fusion_top_k: int = 10
+    rag_final_top_k: int = 6
+    # Reciprocal Rank Fusion damping constant (higher = flatter weighting).
+    rag_rrf_k: int = 60
+    # Preferred embedding platforms, best first. The first one the user holds a
+    # key for is auto-selected; "hash" is a keyless local fallback (dev only).
+    rag_embedding_preference: str = "mistral,openai,vercel,nvidia,google,hash"
+
     @property
     def database_url(self) -> str:
         password = quote_plus(self.postgres_password)

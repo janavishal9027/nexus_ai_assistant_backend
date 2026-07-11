@@ -8,6 +8,18 @@ class MessageDto(BaseModel):
     content: str
     model: Optional[str] = None
     platform: Optional[str] = None
+    # Image data URLs (data:image/...;base64,...) attached to this turn. When
+    # present, providers send the message as OpenAI-style multimodal content so
+    # a vision model can see the images. Not persisted; used at call time only.
+    images: Optional[list[str]] = None
+
+
+class Attachment(BaseModel):
+    """A file attached to a chat turn (image or document). ``data`` is the raw
+    file bytes, base64-encoded (no ``data:`` prefix)."""
+    filename: str
+    mime_type: Optional[str] = None
+    data: str
 
 
 class ChatRequest(BaseModel):
@@ -23,6 +35,9 @@ class ChatRequest(BaseModel):
     # Web Search mode: force a live web search for this turn (bypasses the
     # needs_web_search heuristic) so the answer is grounded in fresh results.
     web_search: bool = False
+    # Files attached to this turn: images go to a vision model, documents have
+    # their text extracted and added as context (handled by multimodal_chat).
+    attachments: Optional[list[Attachment]] = None
 
 
 class ChatResponse(BaseModel):
@@ -59,6 +74,94 @@ class AddKeyRequest(BaseModel):
     platform: str
     key: str
     label: Optional[str] = ""
+
+
+# ─── RAG / Knowledge Base schemas ───────────────────────────────────────────
+class KnowledgeBaseCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+
+
+class KnowledgeBaseUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class KnowledgeBaseDto(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    embedding_platform: Optional[str] = None
+    embedding_model: Optional[str] = None
+    embedding_dim: Optional[int] = None
+    document_count: int = 0
+    chunk_count: int = 0
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class DocumentDto(BaseModel):
+    id: int
+    knowledge_base_id: int
+    filename: str
+    content_type: Optional[str] = None
+    size_bytes: Optional[int] = None
+    status: str
+    error: Optional[str] = None
+    chunk_count: int = 0
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class IngestionJobDto(BaseModel):
+    id: int
+    document_id: int
+    status: str
+    stage: Optional[str] = None
+    progress: int = 0
+    total_chunks: int = 0
+    embedded_chunks: int = 0
+    error: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class DocumentUploadResponse(BaseModel):
+    document: DocumentDto
+    job_id: int
+
+
+class KbSearchRequest(BaseModel):
+    query: str
+    top_k: Optional[int] = None
+
+
+class SourceChunkDto(BaseModel):
+    index: int
+    chunk_id: int
+    document_id: int
+    document_name: str
+    ordinal: int
+    text: str
+    score: float
+
+
+class KbSearchResponse(BaseModel):
+    query: str
+    sources: list[SourceChunkDto]
+
+
+class KbChatRequest(BaseModel):
+    query: str
+    conversation_id: Optional[int] = None
+    model: Optional[str] = None
+    history: Optional[list[MessageDto]] = None
 
 
 # ─── Authentication schemas ─────────────────────────────────────────────────

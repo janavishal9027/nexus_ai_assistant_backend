@@ -10,6 +10,10 @@ from .database import engine, SessionLocal, Base
 from .routes import chat, conversations, keys, models, config
 from .routes import agent as agent_routes
 from .routes import auth as auth_routes
+from .routes import knowledge as knowledge_routes
+# Import RAG models so their tables are registered with Base.metadata before
+# create_all runs (knowledge_bases, documents, document_chunks, ingestion_jobs).
+from .models import rag_models  # noqa: F401
 from .services.model_seeder import seed_models
 from .services.feature_flags import get_agent_features
 from .services.ws_manager import ws_manager
@@ -38,12 +42,42 @@ def _ensure_auth_schema() -> None:
         logger.warning(f"[Auth] Could not ensure owner_id column: {exc}")
 
 
+def _ensure_vector_extension() -> None:
+    """Enable pgvector BEFORE create_all so document_chunks.embedding (a VECTOR
+    column) can be created. Idempotent; best-effort so boot still proceeds (with
+    the JSON fallback) where the extension is unavailable."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        logger.info("[RAG] pgvector extension ensured")
+    except Exception as exc:
+        logger.warning(f"[RAG] Could not enable pgvector extension: {exc}")
+
+
+def _ensure_rag_schema() -> None:
+    """RAG schema bits create_all can't do: the KB tag on conversations, and the
+    functional GIN index that powers keyword (full-text) search over chunks."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS knowledge_base_id INTEGER"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_conversations_kb_id ON conversations (knowledge_base_id)"))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_document_chunks_fts "
+                "ON document_chunks USING gin (to_tsvector('english', text))"
+            ))
+        logger.info("[RAG] Ensured RAG schema (KB tag + keyword FTS index)")
+    except Exception as exc:
+        logger.warning(f"[RAG] Could not ensure RAG schema: {exc}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: create tables, seed models, sync from providers
     logger.info("Starting ChatApp backend...")
+    _ensure_vector_extension()          # must precede create_all (VECTOR columns)
     Base.metadata.create_all(bind=engine)
     _ensure_auth_schema()
+    _ensure_rag_schema()
 
     db = SessionLocal()
     try:
@@ -160,6 +194,7 @@ app.include_router(keys.router)
 app.include_router(models.router)
 app.include_router(agent_routes.router)
 app.include_router(auth_routes.router)
+app.include_router(knowledge_routes.router)
 
 
 @app.get("/api/ping")

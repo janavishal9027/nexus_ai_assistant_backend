@@ -14,6 +14,7 @@ from ..database import get_db
 from ..models.schemas import ChatRequest, ChatResponse
 from ..models.db_models import Conversation, Message, Account
 from ..services.agent import agent_chat, agent_stream_chat
+from ..services.multimodal_chat import multimodal_stream_chat
 from ..services.auth import get_current_account
 from ..services import request_context
 
@@ -65,7 +66,14 @@ async def stream_message(request: ChatRequest, db: Session = Depends(get_db),
     _assert_conversation_access(db, request.conversation_id, account.id)
     request_context.set_owner_id(account.id)   # scope provider keys to this user
     try:
-        conversation_id, result, citations_text = await agent_stream_chat(db, request, owner_id=account.id)
+        # Attachments (images/documents) take an isolated multimodal path that
+        # extracts document text and routes images to a vision model; everything
+        # else goes through the normal agent orchestration.
+        if request.attachments:
+            conversation_id, result, citations_text = await multimodal_stream_chat(
+                db, request, owner_id=account.id)
+        else:
+            conversation_id, result, citations_text = await agent_stream_chat(db, request, owner_id=account.id)
 
         async def event_generator():
             full_content = ""
@@ -128,8 +136,11 @@ async def stream_message(request: ChatRequest, db: Session = Depends(get_db),
         return EventSourceResponse(cancelled_gen())
     except Exception as e:
         logger.error(f"[Chat/Stream] Error: {e}", exc_info=True)
+        # Capture the message now: Python clears `e` when this except block
+        # exits, but error_gen runs later (while streaming the response).
+        err_msg = str(e)
 
         async def error_gen():
-            yield json.dumps({"error": str(e), "done": True})
+            yield json.dumps({"error": err_msg, "done": True})
 
         return EventSourceResponse(error_gen())

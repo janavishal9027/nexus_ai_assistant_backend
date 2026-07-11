@@ -89,6 +89,10 @@ class Conversation(Base):
     # Source conversation this was branched from (null for a normal chat). Added
     # to existing databases via ALTER TABLE at startup.
     parent_id = Column(Integer, index=True, nullable=True)
+    # When set, this is a grounded chat against a Knowledge Base (RAG). Such
+    # conversations are shown in the KB screen, not the main chat history. Added
+    # to existing databases via ALTER TABLE at startup.
+    knowledge_base_id = Column(Integer, index=True, nullable=True)
 
     messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan",
                             order_by="Message.created_at")
