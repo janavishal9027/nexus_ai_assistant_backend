@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
+from datetime import datetime, timezone, timedelta
 
 from ..database import get_db
 from ..models.db_models import Conversation, Message, ChatModel, Account
@@ -34,6 +35,7 @@ def get_all(db: Session = Depends(get_db), account: Account = Depends(get_curren
             title=c.title,
             created_at=c.created_at,
             updated_at=c.updated_at,
+            parent_id=c.parent_id,
         )
         for c in conversations
     ]
@@ -63,6 +65,7 @@ def get_by_id(conversation_id: int, db: Session = Depends(get_db),
         title=conv.title,
         created_at=conv.created_at,
         updated_at=conv.updated_at,
+        parent_id=conv.parent_id,
         messages=[
             MessageDto(
                 role=m.role,
@@ -79,20 +82,43 @@ def get_by_id(conversation_id: int, db: Session = Depends(get_db),
 @router.delete("/{conversation_id}")
 def delete(conversation_id: int, db: Session = Depends(get_db),
            account: Account = Depends(get_current_account)):
+    _owned_or_404(db, conversation_id, account.id)
+    # Cascade to descendant branches: delete this chat and every branch nested
+    # under it (children, grandchildren, …). A branch the user wants to keep is
+    # detached (promoted to top-level) first, so it's no longer a descendant and
+    # survives this delete.
+    to_delete = [conversation_id]
+    frontier = [conversation_id]
+    while frontier:
+        cur = frontier.pop()
+        for (kid,) in db.query(Conversation.id).filter(
+                Conversation.parent_id == cur).all():
+            to_delete.append(kid)
+            frontier.append(kid)
+    # Remove agent-feature rows (memory_chunks) that FK to these conversations,
+    # else the DELETE violates the constraint and 500s.
+    try:
+        from ..models.db_models import MemoryChunk
+        db.query(MemoryChunk).filter(
+            MemoryChunk.conversation_id.in_(to_delete)
+        ).delete(synchronize_session=False)
+    except Exception:
+        db.rollback()
+    for c in db.query(Conversation).filter(Conversation.id.in_(to_delete)).all():
+        db.delete(c)  # messages cascade via the ORM relationship
+    db.commit()
+    return {"success": True, "deleted": to_delete}
+
+
+@router.post("/{conversation_id}/detach")
+def detach(conversation_id: int, db: Session = Depends(get_db),
+           account: Account = Depends(get_current_account)):
+    """Promote a branch to a top-level chat by clearing its parent link. Used
+    when the user unchecks a branch in the parent's delete dialog so it survives
+    and becomes its own chat."""
     conv = _owned_or_404(db, conversation_id, account.id)
-    if conv:
-        # Remove rows added by the agent feature that reference this conversation
-        # via a foreign key (memory_chunks). Without this the DELETE violates the
-        # FK constraint and fails with a 500, and the row reappears on next load.
-        try:
-            from ..models.db_models import MemoryChunk
-            db.query(MemoryChunk).filter(
-                MemoryChunk.conversation_id == conversation_id
-            ).delete(synchronize_session=False)
-        except Exception:
-            db.rollback()
-        db.delete(conv)          # messages cascade via the ORM relationship
-        db.commit()
+    conv.parent_id = None
+    db.commit()
     return {"success": True}
 
 
@@ -121,6 +147,57 @@ def truncate(conversation_id: int, body: TruncateBody, db: Session = Depends(get
     if to_delete:
         db.commit()
     return {"success": True, "deleted": len(to_delete)}
+
+
+class BranchBody(BaseModel):
+    up_to: int  # copy messages [0 .. up_to] inclusive (oldest-first index)
+    target_conversation_id: Optional[int] = None  # None → create a new chat
+
+
+@router.post("/{conversation_id}/branch")
+def branch(conversation_id: int, body: BranchBody, db: Session = Depends(get_db),
+           account: Account = Depends(get_current_account)):
+    """Branch a conversation: copy its history up to (and including) message
+    index `up_to` into another chat — a brand-new one, or an existing target the
+    user picked from the dropdown (the messages are appended there). Returns the
+    target conversation's id so the client can switch to it."""
+    src = _owned_or_404(db, conversation_id, account.id)
+    messages = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation_id)
+        .order_by(Message.created_at.asc())
+        .all()
+    )
+    upto = messages[:max(0, body.up_to) + 1]
+    if not upto:
+        raise HTTPException(status_code=400, detail="Nothing to branch")
+
+    if body.target_conversation_id is not None:
+        target = _owned_or_404(db, body.target_conversation_id, account.id)
+    else:
+        target = Conversation(
+            title=(f"Branch · {src.title}")[:120],
+            owner_id=account.id,
+            parent_id=conversation_id)
+        db.add(target)
+        db.flush()  # assign target.id
+
+    # New timestamps (increasing) so the copies keep their order and land AFTER
+    # any messages already in an existing target.
+    base = datetime.now(timezone.utc)
+    for i, m in enumerate(upto):
+        db.add(Message(
+            conversation_id=target.id,
+            role=m.role,
+            content=m.content,
+            model_used=m.model_used,
+            platform_used=m.platform_used,
+            created_at=base + timedelta(milliseconds=i),
+        ))
+    target.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(target)
+    return {"conversation_id": target.id, "title": target.title, "copied": len(upto)}
 
 
 class UpdateTitle(BaseModel):

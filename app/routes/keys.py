@@ -8,6 +8,9 @@ from ..models.db_models import ApiKey, Account
 from ..models.schemas import AddKeyRequest
 from ..providers.registry import provider_registry
 from ..services.auth import get_current_account
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/keys", tags=["keys"])
 
@@ -83,14 +86,27 @@ async def add_key(request: AddKeyRequest, db: Session = Depends(get_db),
     # after adding the key. Only LLM providers have models; search keys (Tavily)
     # do not, so skip the sync for those.
     models_synced = 0
+    sync_error = None
     if provider_registry.has(request.platform):
         try:
             from ..services.model_sync import sync_provider_models
             result = await sync_provider_models(db, request.platform)
             if isinstance(result, dict):
-                models_synced = result.get("added", 0)
-        except Exception:
-            pass  # key is still saved even if the model fetch fails
+                sync_error = result.get("error")
+                # Prefer the provider's total model count (informative even when
+                # the models were already present from a previous sync).
+                models_synced = result.get("total", result.get("added", 0))
+            logger.info(
+                f"[Keys] Added {request.platform} key for account {account.id}; "
+                f"models_synced={models_synced}"
+                + (f", sync_error={sync_error}" if sync_error else "")
+            )
+        except Exception as e:
+            # Key is still saved even if the model fetch fails — but surface it
+            # instead of failing silently.
+            sync_error = str(e)
+            logger.warning(
+                f"[Keys] Model sync failed for {request.platform}: {e}")
 
     return {
         "id": api_key.id,
@@ -98,6 +114,7 @@ async def add_key(request: AddKeyRequest, db: Session = Depends(get_db),
         "maskedKey": _mask_key(api_key.api_key),
         "status": "unknown",
         "models_synced": models_synced,
+        "sync_error": sync_error,
     }
 
 

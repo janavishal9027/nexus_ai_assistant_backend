@@ -48,6 +48,7 @@ class ConversationDto(BaseModel):
     title: str
     created_at: datetime
     updated_at: Optional[datetime] = None
+    parent_id: Optional[int] = None
     messages: Optional[list[MessageDto]] = None
 
     class Config:

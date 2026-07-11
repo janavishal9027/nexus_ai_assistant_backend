@@ -39,6 +39,36 @@ class ProviderRegistry:
             base_url="https://router.huggingface.co/v1",
         ))
 
+        # Mistral AI - OpenAI-compatible
+        self._register(OpenAICompatProvider(
+            platform_name="mistral",
+            base_url="https://api.mistral.ai/v1",
+        ))
+
+        # Cerebras - OpenAI-compatible (fast inference)
+        self._register(OpenAICompatProvider(
+            platform_name="cerebras",
+            base_url="https://api.cerebras.ai/v1",
+        ))
+
+        # SambaNova - OpenAI-compatible
+        self._register(OpenAICompatProvider(
+            platform_name="sambanova",
+            base_url="https://api.sambanova.ai/v1",
+        ))
+
+        # Vercel AI Gateway - OpenAI-compatible
+        self._register(OpenAICompatProvider(
+            platform_name="vercel",
+            base_url="https://ai-gateway.vercel.sh/v1",
+        ))
+
+        # Z.ai (GLM) - OpenAI-compatible
+        self._register(OpenAICompatProvider(
+            platform_name="zai",
+            base_url="https://api.z.ai/api/paas/v4",
+        ))
+
         # Google AI Studio - Gemini API
         self._register(GoogleProvider())
 

@@ -17,6 +17,11 @@ PROVIDER_MODEL_ENDPOINTS = {
     "groq": "https://api.groq.com/openai/v1/models",
     "nvidia": "https://integrate.api.nvidia.com/v1/models",
     "huggingface": "https://router.huggingface.co/v1/models",
+    "mistral": "https://api.mistral.ai/v1/models",
+    "cerebras": "https://api.cerebras.ai/v1/models",
+    "sambanova": "https://api.sambanova.ai/v1/models",
+    "vercel": "https://ai-gateway.vercel.sh/v1/models",
+    "zai": "https://api.z.ai/api/paas/v4/models",
 }
 
 

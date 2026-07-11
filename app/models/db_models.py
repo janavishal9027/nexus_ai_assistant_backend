@@ -86,6 +86,9 @@ class Conversation(Base):
     owner_id = Column(Integer, index=True, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    # Source conversation this was branched from (null for a normal chat). Added
+    # to existing databases via ALTER TABLE at startup.
+    parent_id = Column(Integer, index=True, nullable=True)
 
     messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan",
                             order_by="Message.created_at")

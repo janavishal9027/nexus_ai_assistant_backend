@@ -97,6 +97,14 @@ _SIMPLE_GREETINGS = {
 _NON_CHAT_HINTS = (
     "image", "embed", "embedding", "rerank", "moderation", "tts", "whisper",
     "audio", "speech", "stable-diffusion", "sdxl", "flux", "dall-e", "video",
+    # Safety / moderation / classifier / reward / OCR / retrieval models: these
+    # emit verdicts, scores or vectors, NOT conversation, so a chat routed to
+    # them comes back as e.g. {"User Safety": "safe"} instead of a reply.
+    "guard", "safety", "shieldgemma", "classifier", "detector", "reward",
+    "ocr", "retriever",
+    # Groq's "compound" agentic systems return 200 with no streamed chat text
+    # through our path (empty reply), so keep them out of the auto pool.
+    "compound",
     # Google (and others) non-text families that error out on chat completions.
     "imagen", "veo", "lyria", "music", "gemini-embedding", "text-embedding", "aqa",
 )
@@ -234,6 +242,24 @@ def _get_ordered_models(
             logger.warning("[Router] Deep Research requested but no >=400B model is available")
         return big
 
+    # Provider-scoped auto ("auto:<platform>"): let the app auto-pick within a
+    # single provider (e.g. the user chose "Groq · Auto"). Order by complexity
+    # tier like global auto, but only among that platform's chat models.
+    if requested_model and requested_model.lower().startswith("auto:"):
+        plat = requested_model.split(":", 1)[1].strip().lower()
+        scoped = [m for m in models if m.platform == plat and _is_chatty(m)]
+        desired = _estimate_tier(messages) if messages else "Large"
+        target = _TIER_LEVEL.get(desired, 2)
+        scoped.sort(
+            key=lambda m: (abs(_TIER_LEVEL.get(m.size_label, 1) - target), m.priority))
+        if scoped:
+            logger.info(
+                f"[Router] Provider-auto '{plat}' → {len(scoped)} model(s); "
+                f"top pick: {scoped[0].display_name}")
+        else:
+            logger.warning(f"[Router] Provider-auto '{plat}' but no chat model available")
+        return scoped
+
     if requested_model and requested_model.lower() != "auto":
         ordered = []
         rest = []
@@ -357,22 +383,23 @@ async def route_chat(
                         f"[Router] Error from {model.display_name} ({model.platform}): {e}"
                     )
                     skip_keys.add(skip_id)
+                    msg = str(e).lower()
+                    # Provider-level failure (bad, forbidden or uncredited key) →
+                    # skip the WHOLE provider immediately, regardless of whether the
+                    # error is "retryable" (e.g. Vercel's 403 "requires a valid
+                    # credit card" is not).
+                    if any(t in msg for t in (
+                        "401", "403", "unauthorized", "forbidden", "permission",
+                        "invalid api key", "authentication", "credit card",
+                        "customer_verification", "payment required", "billing",
+                    )):
+                        skip_platforms.add(model.platform)
+                        skip_models.add(model.id)
+                        break
 
                     if rate_limit.is_retryable_error(e):
                         rate_limit.set_cooldown(model.platform, model.model_id, key.id)
                         rate_limit.record_rate_limit_hit(model.platform, model.model_id, key.id)
-
-                        msg = str(e).lower()
-                        # Auth failure → skip the whole provider (its key is bad),
-                        # not just this one model, so we don't waste a round-trip on
-                        # every other model behind the same failing key.
-                        if any(t in msg for t in (
-                            "401", "403", "unauthorized", "forbidden",
-                            "permission", "invalid api key", "authentication",
-                        )):
-                            skip_platforms.add(model.platform)
-                            skip_models.add(model.id)
-                            break
                         # Repeated quota/rate-limit from a provider → treat as a
                         # project-level limit and skip the rest of that provider.
                         if any(t in msg for t in (
@@ -478,15 +505,30 @@ async def route_stream_chat(
                     # and fall back to the next model — instead of after the router
                     # has already returned, which would surface as a hard failure.
                     agen = stream.__aiter__()
+                    first_chunk, has_first = None, False
                     try:
-                        first_chunk = await agen.__anext__()
-                        has_first = True
+                        # Pull the first *non-empty* chunk. This surfaces provider
+                        # errors inside the retry loop AND detects models that 200
+                        # with no real content (e.g. Groq's "compound"), so we can
+                        # fall back instead of returning an empty reply.
+                        while True:
+                            chunk = await agen.__anext__()
+                            if chunk:
+                                first_chunk, has_first = chunk, True
+                                break
                     except StopAsyncIteration:
-                        first_chunk, has_first = None, False
+                        pass
 
-                    async def _primed_stream(_agen=agen, _first=first_chunk, _has=has_first):
-                        if _has:
-                            yield _first
+                    if not has_first:
+                        logger.warning(
+                            f"[Router/Stream] {model.display_name} ({model.platform}) "
+                            f"streamed no content; falling back to the next model"
+                        )
+                        skip_keys.add(skip_id)
+                        continue
+
+                    async def _primed_stream(_agen=agen, _first=first_chunk):
+                        yield _first
                         async for chunk in _agen:
                             yield chunk
 
@@ -506,20 +548,23 @@ async def route_stream_chat(
                         f"[Router/Stream] Error from {model.display_name} ({model.platform}): {e}"
                     )
                     skip_keys.add(skip_id)
+                    msg = str(e).lower()
+                    # Provider-level failure (bad, forbidden or uncredited key) →
+                    # skip the WHOLE provider immediately so we don't waste a
+                    # round-trip on every other model behind the same failing key.
+                    # Checked regardless of whether the error is "retryable" (e.g.
+                    # Vercel's 403 "requires a valid credit card" is not).
+                    if any(t in msg for t in (
+                        "401", "403", "unauthorized", "forbidden", "permission",
+                        "invalid api key", "authentication", "credit card",
+                        "customer_verification", "payment required", "billing",
+                    )):
+                        skip_platforms.add(model.platform)
+                        skip_models.add(model.id)
+                        break
                     if rate_limit.is_retryable_error(e):
                         rate_limit.set_cooldown(model.platform, model.model_id, key.id)
                         rate_limit.record_rate_limit_hit(model.platform, model.model_id, key.id)
-                        msg = str(e).lower()
-                        # Auth failure → skip the whole provider (its key is bad),
-                        # not just this one model, so we don't waste a round-trip on
-                        # every other model behind the same failing key.
-                        if any(t in msg for t in (
-                            "401", "403", "unauthorized", "forbidden",
-                            "permission", "invalid api key", "authentication",
-                        )):
-                            skip_platforms.add(model.platform)
-                            skip_models.add(model.id)
-                            break
                         # Repeated quota/rate-limit from a provider → treat as a
                         # project-level limit and skip the rest of that provider.
                         if any(t in msg for t in (

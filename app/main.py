@@ -31,6 +31,8 @@ def _ensure_auth_schema() -> None:
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_conversations_owner_id ON conversations (owner_id)"))
             conn.execute(text("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS owner_id INTEGER"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_api_keys_owner_id ON api_keys (owner_id)"))
+            conn.execute(text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS parent_id INTEGER"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_conversations_parent_id ON conversations (parent_id)"))
         logger.info("[Auth] Ensured conversations.owner_id and api_keys.owner_id columns exist")
     except Exception as exc:
         logger.warning(f"[Auth] Could not ensure owner_id column: {exc}")
