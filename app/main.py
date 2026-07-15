@@ -11,6 +11,7 @@ from .routes import chat, conversations, keys, models, config
 from .routes import agent as agent_routes
 from .routes import auth as auth_routes
 from .routes import knowledge as knowledge_routes
+from .routes import projects as projects_routes
 # Import RAG models so their tables are registered with Base.metadata before
 # create_all runs (knowledge_bases, documents, document_chunks, ingestion_jobs).
 from .models import rag_models  # noqa: F401
@@ -37,6 +38,8 @@ def _ensure_auth_schema() -> None:
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_api_keys_owner_id ON api_keys (owner_id)"))
             conn.execute(text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS parent_id INTEGER"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_conversations_parent_id ON conversations (parent_id)"))
+            conn.execute(text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS project_id INTEGER"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_conversations_project_id ON conversations (project_id)"))
         logger.info("[Auth] Ensured conversations.owner_id and api_keys.owner_id columns exist")
     except Exception as exc:
         logger.warning(f"[Auth] Could not ensure owner_id column: {exc}")
@@ -65,7 +68,18 @@ def _ensure_rag_schema() -> None:
                 "CREATE INDEX IF NOT EXISTS ix_document_chunks_fts "
                 "ON document_chunks USING gin (to_tsvector('english', text))"
             ))
-        logger.info("[RAG] Ensured RAG schema (KB tag + keyword FTS index)")
+            # Per-conversation RAG (A.3): chat-attached documents live on a
+            # conversation instead of a KB.
+            conn.execute(text("ALTER TABLE documents ALTER COLUMN knowledge_base_id DROP NOT NULL"))
+            conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS conversation_id INTEGER"))
+            conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS embedding_platform VARCHAR(64)"))
+            conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(128)"))
+            conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS embedding_dim INTEGER"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_conversation_id ON documents (conversation_id)"))
+            conn.execute(text("ALTER TABLE document_chunks ALTER COLUMN knowledge_base_id DROP NOT NULL"))
+            conn.execute(text("ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS conversation_id INTEGER"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_document_chunks_conversation_id ON document_chunks (conversation_id)"))
+        logger.info("[RAG] Ensured RAG schema (KB + per-conversation columns + FTS index)")
     except Exception as exc:
         logger.warning(f"[RAG] Could not ensure RAG schema: {exc}")
 
@@ -195,8 +209,27 @@ app.include_router(models.router)
 app.include_router(agent_routes.router)
 app.include_router(auth_routes.router)
 app.include_router(knowledge_routes.router)
+app.include_router(projects_routes.router)
 
 
 @app.get("/api/ping")
 def ping():
     return {"status": "ok"}
+
+
+@app.get("/api/health")
+def health():
+    """Liveness + dependency health (chat-module A.6). Reachable-but-a-dependency-
+    down returns 200 with status='degraded' so the client can tell a degraded
+    backend apart from an unreachable one."""
+    components = {}
+    status = "healthy"
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        components["database"] = "healthy"
+    except Exception as exc:
+        logger.warning(f"[Health] database check failed: {exc}")
+        components["database"] = "down"
+        status = "degraded"
+    return {"status": status, "components": components}

@@ -64,16 +64,96 @@ class ConversationDto(BaseModel):
     created_at: datetime
     updated_at: Optional[datetime] = None
     parent_id: Optional[int] = None
+    project_id: Optional[int] = None
     messages: Optional[list[MessageDto]] = None
 
     class Config:
         from_attributes = True
 
 
+# ─── Projects (chat-module A.7) ─────────────────────────────────────────────
+class ProjectCreate(BaseModel):
+    name: str
+    instructions: Optional[str] = None
+
+
+class ProjectUpdate(BaseModel):
+    name: Optional[str] = None
+    instructions: Optional[str] = None
+
+
+class ProjectDto(BaseModel):
+    id: int
+    name: str
+    instructions: Optional[str] = None
+    conversation_count: int = 0
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AssignProjectRequest(BaseModel):
+    project_id: Optional[int] = None  # None → move to ungrouped
+
+
 class AddKeyRequest(BaseModel):
     platform: str
     key: str
     label: Optional[str] = ""
+
+
+# ─── Clarifier (chat-module A.2) ────────────────────────────────────────────
+class ClarifyOption(BaseModel):
+    label: str
+    description: Optional[str] = None
+
+
+class ClarifyQuestion(BaseModel):
+    header: str
+    question: str
+    multi_select: bool = False
+    options: list[ClarifyOption] = []
+
+
+class ClarifyRequest(BaseModel):
+    message: str
+    history: Optional[list[MessageDto]] = None
+    model: Optional[str] = None
+
+
+class ClarifyResponse(BaseModel):
+    clarify: bool = False
+    question: Optional[ClarifyQuestion] = None
+
+
+class SuggestRequest(BaseModel):
+    conversation_id: int
+    model: Optional[str] = None
+
+
+class SuggestResponse(BaseModel):
+    suggestions: list[str] = []
+
+
+# ─── Document decisions / export (chat-module A.4) ──────────────────────────
+class DocumentDecisionRequest(BaseModel):
+    conversation_id: Optional[int] = None
+    content: Optional[str] = None
+    model: Optional[str] = None
+
+
+class DocumentDecisionResponse(BaseModel):
+    document: bool = False
+    format: Optional[str] = None
+    formats: list[str] = []
+
+
+class ExportRequest(BaseModel):
+    content: str
+    format: str
+    title: Optional[str] = None
 
 
 # ─── RAG / Knowledge Base schemas ───────────────────────────────────────────

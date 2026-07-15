@@ -93,9 +93,26 @@ class Conversation(Base):
     # conversations are shown in the KB screen, not the main chat history. Added
     # to existing databases via ALTER TABLE at startup.
     knowledge_base_id = Column(Integer, index=True, nullable=True)
+    # Project this conversation is grouped under (A.7), or NULL for ungrouped.
+    # Added to existing databases via ALTER TABLE at startup.
+    project_id = Column(Integer, index=True, nullable=True)
 
     messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan",
                             order_by="Message.created_at")
+
+
+class Project(Base):
+    """A project groups conversations and gives them shared standing
+    instructions (chat-module A.7)."""
+    __tablename__ = "projects"
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, index=True, nullable=True)
+    name = Column(String(255), nullable=False)
+    instructions = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
 
 
 class Message(Base):

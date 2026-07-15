@@ -8,6 +8,7 @@ message format. Returns the SAME ``(conversation_id, StreamRouteResult,
 citations_text)`` tuple as ``agent_stream_chat`` so the SSE route generator is
 reused unchanged.
 """
+import asyncio
 import base64
 import binascii
 import logging
@@ -20,6 +21,8 @@ from ..models.schemas import ChatRequest, MessageDto
 from ..models.db_models import Conversation, Message, ChatModel, ApiKey
 from .fallback_router import route_stream_chat, _is_chatty
 from .rag_chunking import extract_text, clean_text
+from .rag_ingestion import ingest_conversation_document
+from .agent import RESPONSE_FOLLOWUP_GUIDE
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +69,7 @@ async def multimodal_stream_chat(db: Session, request: ChatRequest, owner_id: Op
     img_names: list[str] = []
     doc_blocks: list[str] = []
     doc_names: list[str] = []
+    doc_raws: list[tuple[str, bytes]] = []   # full bytes → per-conversation RAG
     total_doc = 0
 
     for att in attachments:
@@ -91,6 +95,7 @@ async def multimodal_stream_chat(db: Session, request: ChatRequest, owner_id: Op
                 continue
             if not text.strip():
                 continue
+            doc_raws.append((att.filename, raw))   # index full doc for later turns
             if total_doc >= _MAX_TOTAL_DOC_CHARS:
                 continue
             text = text[:min(_MAX_DOC_CHARS, _MAX_TOTAL_DOC_CHARS - total_doc)]
@@ -128,6 +133,12 @@ async def multimodal_stream_chat(db: Session, request: ChatRequest, owner_id: Op
     db.add(Message(conversation_id=conversation_id, role="user", content=stored))
     db.commit()
 
+    # Per-conversation RAG (A.3): index attached documents in the background so
+    # they're retrievable on later turns in this conversation.
+    for _fname, _raw in doc_raws:
+        asyncio.create_task(
+            ingest_conversation_document(conversation_id, owner_id, _fname, _raw))
+
     # Effective prompt: document text as grounding context before the question.
     prompt = request.message
     if doc_blocks:
@@ -140,9 +151,12 @@ async def multimodal_stream_chat(db: Session, request: ChatRequest, owner_id: Op
     elif image_urls and not request.message.strip():
         prompt = "Describe the attached image(s)."
 
-    messages: list[MessageDto] = []
+    messages: list[MessageDto] = [
+        MessageDto(role="system",
+                   content="You are a helpful assistant." + RESPONSE_FOLLOWUP_GUIDE),
+    ]
     for m in (request.history or []):
-        if m.role in ("user", "assistant", "system"):
+        if m.role in ("user", "assistant"):
             messages.append(MessageDto(role=m.role, content=m.content))
     messages.append(MessageDto(role="user", content=prompt, images=image_urls or None))
 

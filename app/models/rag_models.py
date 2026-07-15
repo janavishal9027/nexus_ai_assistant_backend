@@ -74,15 +74,24 @@ class Document(Base):
     __tablename__ = "documents"
 
     id = Column(Integer, primary_key=True, index=True)
+    # Either a KB document (knowledge_base_id set) OR a chat-attached document
+    # (conversation_id set) — the latter powers per-conversation RAG.
     knowledge_base_id = Column(
         Integer, ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+        nullable=True, index=True,
     )
+    conversation_id = Column(Integer, index=True, nullable=True)
     owner_id = Column(Integer, index=True, nullable=True)
 
     filename = Column(String(512), nullable=False)
     content_type = Column(String(128), nullable=True)
     size_bytes = Column(Integer, nullable=True)
+
+    # Embedding space this document's chunks live in (so a query embeds the same
+    # way). Set at ingest; only meaningful for conversation-scoped docs.
+    embedding_platform = Column(String(64), nullable=True)
+    embedding_model = Column(String(128), nullable=True)
+    embedding_dim = Column(Integer, nullable=True)
 
     # pending → processing → completed | failed
     status = Column(String(32), default="pending", index=True)
@@ -110,8 +119,10 @@ class DocumentChunk(Base):
         Integer, ForeignKey("documents.id", ondelete="CASCADE"),
         nullable=False, index=True,
     )
-    # Denormalized so semantic/keyword search can filter by KB in one predicate.
-    knowledge_base_id = Column(Integer, nullable=False, index=True)
+    # Denormalized scope keys so search filters in one predicate — a chunk
+    # belongs to a KB (knowledge_base_id) or a conversation (conversation_id).
+    knowledge_base_id = Column(Integer, nullable=True, index=True)
+    conversation_id = Column(Integer, index=True, nullable=True)
     owner_id = Column(Integer, index=True, nullable=True)
 
     ordinal = Column(Integer, nullable=False)   # position within the document

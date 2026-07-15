@@ -493,6 +493,17 @@ def _append_tool_results(
     return messages
 
 
+# Global response guideline: end useful answers with a few inline follow-up
+# suggestions (surfaced in the response text itself, not as separate chips).
+RESPONSE_FOLLOWUP_GUIDE = (
+    "\n\nWhen it would genuinely help, END your response with a short section "
+    'titled "**Follow-ups**" containing 2-3 concise, specific questions the user '
+    "is likely to ask next, written as a markdown bullet list. Keep them tightly "
+    "relevant to the topic. Omit this section for greetings, acknowledgements, or "
+    "trivial replies."
+)
+
+
 def _build_agent_messages(
     db: Session,
     conversation_id: int,
@@ -500,6 +511,7 @@ def _build_agent_messages(
     history: list[MessageDto] | None = None,
     web_context: str | None = None,
     deep_research: bool = False,
+    doc_context: str | None = None,
 ) -> list[MessageDto]:
     """Build the message list with system prompt and context window trimming."""
     config = get_config()
@@ -510,6 +522,30 @@ def _build_agent_messages(
     # Always give the model the real current date (it can't know it otherwise).
     today = datetime.now().strftime("%A, %B %d, %Y")
     system_prompt = f"{system_prompt}\n\nToday's date is {today}."
+
+    # Inline follow-up suggestions: the responder ends useful answers with a few
+    # next-step questions in the response itself (chat-module A.2 · suggester,
+    # surfaced in-line rather than as separate chips).
+    system_prompt += RESPONSE_FOLLOWUP_GUIDE
+
+    # Project standing instructions (A.7) — applied at the project-instructions
+    # precedence: above learned memory / intent defaults, but below safety and
+    # the user's explicit latest instruction.
+    try:
+        from ..models.db_models import Project
+        conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+        if conv is not None and getattr(conv, "project_id", None) is not None:
+            proj = db.query(Project).filter(Project.id == conv.project_id).first()
+            if proj is not None and (proj.instructions or "").strip():
+                system_prompt += (
+                    "\n\n=== PROJECT INSTRUCTIONS ===\n"
+                    "Standing instructions for every chat in this project. Follow them "
+                    "unless they conflict with a safety rule or an explicit instruction "
+                    "in the user's latest message.\n\n"
+                    f"{proj.instructions.strip()}"
+                )
+    except Exception as exc:
+        logger.warning(f"[Agent] project instructions skipped: {exc}")
 
     # Deep Research mode: instruct the (large) model to produce a thorough,
     # structured, well-sourced answer rather than a quick reply.
@@ -537,6 +573,18 @@ def _build_agent_messages(
             "the search results. Summarize the findings clearly and cite sources with URLs. "
             "If the results don't fully answer the question, say what was found and what wasn't.\n\n"
             f"=== LIVE WEB SEARCH RESULTS ===\n{web_context}\n=== END OF SEARCH RESULTS ==="
+        )
+
+    # Per-conversation document context (A.3): excerpts from files the user
+    # attached earlier in this conversation, retrieved for the current question.
+    if doc_context:
+        system_prompt += (
+            "\n\n=== ATTACHED DOCUMENTS (this conversation) ===\n"
+            "The user attached document(s) earlier in this conversation. The most "
+            "relevant excerpts are below. Treat them as authoritative context for "
+            "the question, and cite the source name in brackets when you use one. "
+            "If they don't contain the answer, say so rather than guessing.\n\n"
+            f"{doc_context}\n=== END OF DOCUMENTS ==="
         )
 
     messages: list[MessageDto] = []
@@ -885,9 +933,23 @@ async def agent_stream_chat(db: Session, request: ChatRequest, on_tool_event=Non
         else:
             logger.warning(f"[Agent/Stream] Web search returned no results")
 
+    # Per-conversation RAG (A.3): retrieve relevant chunks from documents the
+    # user attached earlier in THIS conversation and inject them as context.
+    # Guarded + no-op when the conversation has no documents.
+    doc_context = None
+    try:
+        from .rag_retrieval import retrieve_conversation_context
+        doc_ctx, doc_srcs = await retrieve_conversation_context(
+            db, conversation_id, request.message, owner_id)
+        if doc_ctx:
+            doc_context = doc_ctx
+            logger.info(f"[Agent/Stream] Conversation-RAG injected {len(doc_srcs)} source(s)")
+    except Exception as e:
+        logger.warning(f"[Agent/Stream] conversation-RAG skipped: {e}")
+
     messages = _build_agent_messages(
         db, conversation_id, request.message, request.history, web_context,
-        deep_research=deep_research,
+        deep_research=deep_research, doc_context=doc_context,
     )
 
     # --- Tool orchestration loop (runs in non-streaming mode before streaming begins) ---

@@ -19,7 +19,9 @@ from typing import Optional
 from ..database import SessionLocal
 from ..config import get_settings
 from ..models.rag_models import Document, DocumentChunk, IngestionJob, KnowledgeBase
-from ..providers.embeddings import embedding_provider_for_kb, INPUT_PASSAGE
+from ..providers.embeddings import (
+    embedding_provider_for_kb, resolve_embedding_provider, INPUT_PASSAGE,
+)
 from .rag_chunking import extract_text, clean_text, chunk_text
 
 logger = logging.getLogger(__name__)
@@ -177,6 +179,56 @@ def _fail(document_id: int, message: str) -> None:
         db.commit()
     except Exception as exc:  # pragma: no cover
         logger.error(f"[Ingest] Could not record failure for {document_id}: {exc}")
+    finally:
+        db.close()
+
+
+async def ingest_conversation_document(
+    conversation_id: int, owner_id: Optional[int], filename: str, content: bytes,
+) -> None:
+    """Chunk + embed a chat-attached document into the per-conversation store
+    (A.3) so it's retrievable on later turns. Best-effort; never raises."""
+    db = SessionLocal()
+    try:
+        text = clean_text(extract_text(filename, content))
+        if not text.strip():
+            logger.info(f"[ConvRAG] {filename}: no extractable text; skipped")
+            return
+        settings = get_settings()
+        chunks = chunk_text(text, settings.rag_chunk_size, settings.rag_chunk_overlap)
+        if not chunks:
+            return
+
+        provider = resolve_embedding_provider(db, owner_id)
+        vectors: list[list[float]] = []
+        for i in range(0, len(chunks), _EMBED_BATCH):
+            vectors.extend(await provider.embed(chunks[i:i + _EMBED_BATCH],
+                                                input_type=INPUT_PASSAGE))
+        if len(vectors) != len(chunks):
+            return
+
+        doc = Document(
+            conversation_id=conversation_id, knowledge_base_id=None, owner_id=owner_id,
+            filename=filename[:512], size_bytes=len(content), status="completed",
+            chunk_count=len(chunks), raw=content,
+            embedding_platform=provider.platform, embedding_model=provider.model,
+            embedding_dim=provider.dim or (len(vectors[0]) if vectors else None),
+        )
+        db.add(doc)
+        db.commit()
+        db.refresh(doc)
+        for ordinal, (chunk, vec) in enumerate(zip(chunks, vectors)):
+            db.add(DocumentChunk(
+                document_id=doc.id, conversation_id=conversation_id,
+                knowledge_base_id=None, owner_id=owner_id, ordinal=ordinal,
+                text=chunk, token_count=max(1, len(chunk) // 4), embedding=vec,
+            ))
+        db.commit()
+        logger.info(f"[ConvRAG] {filename} → {len(chunks)} chunks in conversation "
+                    f"{conversation_id} ({provider.platform}/{provider.model})")
+    except Exception as e:
+        logger.warning(f"[ConvRAG] ingest failed for {filename}: {e}")
+        db.rollback()
     finally:
         db.close()
 

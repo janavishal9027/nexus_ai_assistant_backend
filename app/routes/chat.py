@@ -11,10 +11,19 @@ from sqlalchemy.orm import Session
 from datetime import datetime, timezone
 
 from ..database import get_db
-from ..models.schemas import ChatRequest, ChatResponse
+from fastapi import Response
+from ..models.schemas import (
+    ChatRequest, ChatResponse, ClarifyRequest, ClarifyResponse,
+    SuggestRequest, SuggestResponse, DocumentDecisionRequest,
+    DocumentDecisionResponse, ExportRequest,
+)
 from ..models.db_models import Conversation, Message, Account
 from ..services.agent import agent_chat, agent_stream_chat
 from ..services.multimodal_chat import multimodal_stream_chat
+from ..services.clarifier import assess_clarification
+from ..services.suggester import suggest_followups
+from ..services.document_decision import decide_document
+from ..services.document_export import export_document
 from ..services.auth import get_current_account
 from ..services import request_context
 
@@ -56,6 +65,80 @@ async def send_message(request: ChatRequest, db: Session = Depends(get_db),
             content={"conversation_id": None, "content": f"Error: {e}",
                      "model": None, "platform": None, "fallback_attempts": 0},
         )
+
+
+@router.post("/clarify", response_model=ClarifyResponse)
+async def clarify(request: ClarifyRequest, db: Session = Depends(get_db),
+                  account: Account = Depends(get_current_account)):
+    """Pre-flight clarification gate (chat-module A.2): decide whether this turn
+    needs a blocking clarifying question before the answer streams. Fails open
+    (clarify=false) so a clarifier hiccup never blocks a chat."""
+    request_context.set_owner_id(account.id)
+    try:
+        result = await assess_clarification(
+            db, request.message, history=request.history,
+            owner_id=account.id, model=request.model,
+        )
+    except Exception as e:
+        logger.warning(f"[Clarify] failed, proceeding without: {e}")
+        return ClarifyResponse(clarify=False)
+    return ClarifyResponse(**result)
+
+
+@router.post("/suggest", response_model=SuggestResponse)
+async def suggest(request: SuggestRequest, db: Session = Depends(get_db),
+                  account: Account = Depends(get_current_account)):
+    """Post-turn follow-up suggestions (chat-module A.2 · the Suggester agent).
+    Fails open with an empty list so it never disrupts the chat."""
+    request_context.set_owner_id(account.id)
+    try:
+        items = await suggest_followups(
+            db, request.conversation_id, owner_id=account.id, model=request.model)
+    except Exception as e:
+        logger.warning(f"[Suggest] failed: {e}")
+        items = []
+    return SuggestResponse(suggestions=items)
+
+
+@router.post("/document-decision", response_model=DocumentDecisionResponse)
+async def document_decision(request: DocumentDecisionRequest, db: Session = Depends(get_db),
+                            account: Account = Depends(get_current_account)):
+    """Backend-authoritative document triage (A.4): whether the last answer is
+    export-worthy and in which format(s). Fails open (document=false)."""
+    try:
+        if request.content is not None:
+            from ..services.document_decision import classify_content
+            d = classify_content(request.content)
+        elif request.conversation_id is not None:
+            d = decide_document(db, request.conversation_id, account.id)
+        else:
+            d = {"document": False, "format": None, "formats": []}
+    except Exception as e:
+        logger.warning(f"[DocDecision] failed: {e}")
+        d = {"document": False, "format": None, "formats": []}
+    return DocumentDecisionResponse(**d)
+
+
+@router.post("/export")
+async def export(request: ExportRequest, account: Account = Depends(get_current_account)):
+    """Generate a downloadable document (A.4) from answer content in the chosen
+    format. Returns the file bytes with a Content-Disposition attachment."""
+    from urllib.parse import quote
+    try:
+        data, mime, filename = export_document(
+            request.content, request.format, request.title or "document")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"[Export] failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Export failed: {e}")
+    return Response(
+        content=data, media_type=mime,
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+            "X-Filename": filename,
+        },
+    )
 
 
 @router.post("/stream")

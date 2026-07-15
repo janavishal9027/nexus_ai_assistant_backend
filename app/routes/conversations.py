@@ -38,6 +38,7 @@ def get_all(db: Session = Depends(get_db), account: Account = Depends(get_curren
             created_at=c.created_at,
             updated_at=c.updated_at,
             parent_id=c.parent_id,
+            project_id=c.project_id,
         )
         for c in conversations
     ]
@@ -200,6 +201,25 @@ def branch(conversation_id: int, body: BranchBody, db: Session = Depends(get_db)
     db.commit()
     db.refresh(target)
     return {"conversation_id": target.id, "title": target.title, "copied": len(upto)}
+
+
+class AssignProject(BaseModel):
+    project_id: Optional[int] = None  # None → move to ungrouped
+
+
+@router.post("/{conversation_id}/assign")
+def assign_project(conversation_id: int, body: AssignProject, db: Session = Depends(get_db),
+                   account: Account = Depends(get_current_account)):
+    """Group a conversation under a project (A.7), or ungroup it (project_id=null)."""
+    conv = _owned_or_404(db, conversation_id, account.id)
+    if body.project_id is not None:
+        from ..models.db_models import Project
+        proj = db.query(Project).filter(Project.id == body.project_id).first()
+        if proj is None or (proj.owner_id is not None and proj.owner_id != account.id):
+            raise HTTPException(status_code=404, detail="Project not found")
+    conv.project_id = body.project_id
+    db.commit()
+    return {"success": True, "project_id": body.project_id}
 
 
 class UpdateTitle(BaseModel):

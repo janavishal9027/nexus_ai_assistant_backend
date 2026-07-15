@@ -187,6 +187,131 @@ async def retrieve(db: Session, kb: KnowledgeBase, query: str, owner_id: Optiona
     return results
 
 
+# ─── Per-conversation RAG (A.3) ─────────────────────────────────────────────
+
+def _semantic_search_conv(db: Session, conversation_id: int, query_vec: list[float],
+                          limit: int) -> list[DocumentChunk]:
+    if not query_vec:
+        return []
+    if HAS_PGVECTOR:
+        distance = DocumentChunk.embedding.cosine_distance(query_vec)
+        return (
+            db.query(DocumentChunk)
+            .filter(DocumentChunk.conversation_id == conversation_id)
+            .filter(DocumentChunk.embedding.isnot(None))
+            .order_by(distance.asc())
+            .limit(limit)
+            .all()
+        )
+    rows = (db.query(DocumentChunk)
+            .filter(DocumentChunk.conversation_id == conversation_id).limit(4000).all())
+    qn = math.sqrt(sum(v * v for v in query_vec)) or 1.0
+    scored = []
+    for r in rows:
+        emb = list(r.embedding) if r.embedding is not None else None
+        if not emb or len(emb) != len(query_vec):
+            continue
+        dot = sum(a * b for a, b in zip(query_vec, emb))
+        rn = math.sqrt(sum(v * v for v in emb)) or 1.0
+        scored.append((dot / (qn * rn), r))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [r for _, r in scored[:limit]]
+
+
+def _keyword_search_conv(db: Session, conversation_id: int, query: str,
+                         limit: int) -> list[DocumentChunk]:
+    query = (query or "").strip()
+    if not query:
+        return []
+    tsv = func.to_tsvector("english", DocumentChunk.text)
+    tsq = func.plainto_tsquery("english", query)
+    try:
+        return (
+            db.query(DocumentChunk)
+            .filter(DocumentChunk.conversation_id == conversation_id)
+            .filter(tsv.op("@@")(tsq))
+            .order_by(func.ts_rank(tsv, tsq).desc())
+            .limit(limit)
+            .all()
+        )
+    except Exception:
+        db.rollback()
+        return (db.query(DocumentChunk)
+                .filter(DocumentChunk.conversation_id == conversation_id)
+                .filter(DocumentChunk.text.ilike(f"%{query}%")).limit(limit).all())
+
+
+def conversation_has_docs(db: Session, conversation_id: int) -> bool:
+    return bool(
+        db.query(DocumentChunk.id)
+        .filter(DocumentChunk.conversation_id == conversation_id)
+        .first()
+    )
+
+
+async def retrieve_conversation_context(
+    db: Session, conversation_id: int, query: str, owner_id: Optional[int],
+    token_budget: int = 1800,
+) -> tuple[str, list[str]]:
+    """Hybrid-retrieve the most relevant chunks of this conversation's attached
+    documents for the query, compressed to a token budget. Returns (context, sources).
+    Returns ("", []) when the conversation has no documents."""
+    if not conversation_has_docs(db, conversation_id):
+        return "", []
+
+    settings = get_settings()
+    # Embed the query in the same space the conversation's docs were embedded in.
+    doc = (db.query(Document)
+           .filter(Document.conversation_id == conversation_id,
+                   Document.embedding_model.isnot(None))
+           .order_by(Document.id.desc()).first())
+    provider = embedding_provider_for_kb(
+        db, owner_id,
+        getattr(doc, "embedding_platform", None),
+        getattr(doc, "embedding_model", None),
+        getattr(doc, "embedding_dim", None),
+    )
+    query_vec = await provider.embed_one(query, input_type=INPUT_QUERY)
+
+    def _search():
+        return (
+            _semantic_search_conv(db, conversation_id, query_vec, settings.rag_semantic_top_n),
+            _keyword_search_conv(db, conversation_id, query, settings.rag_keyword_top_n),
+        )
+    sem, kw = await asyncio.to_thread(_search)
+
+    fused = reciprocal_rank_fusion([sem, kw], settings.rag_rrf_k, settings.rag_fusion_top_k)
+    if not fused:
+        return "", []
+
+    reranker = resolve_reranker(db, owner_id)
+    order = await reranker.rerank(query, [c.text for c, _ in fused], settings.rag_final_top_k)
+    final = [fused[i][0] for i in order if 0 <= i < len(fused)]
+
+    # Compressor: keep the best chunks until the token budget (~4 chars/token).
+    picked: list[DocumentChunk] = []
+    used = 0
+    for ch in final:
+        cost = max(1, len(ch.text) // 4)
+        if picked and used + cost > token_budget:
+            break
+        picked.append(ch)
+        used += cost
+    if not picked:
+        return "", []
+
+    doc_ids = {c.document_id for c in picked}
+    names = dict(db.query(Document.id, Document.filename)
+                 .filter(Document.id.in_(doc_ids)).all()) if doc_ids else {}
+    lines, sources = [], []
+    for i, ch in enumerate(picked, 1):
+        name = names.get(ch.document_id, "document")
+        lines.append(f"[{i}] (from {name})\n{ch.text}")
+        if name not in sources:
+            sources.append(name)
+    return "\n\n".join(lines), sources
+
+
 def build_grounded_messages(
     query: str, chunks: list[dict], history: Optional[list[MessageDto]] = None,
 ) -> list[MessageDto]:
