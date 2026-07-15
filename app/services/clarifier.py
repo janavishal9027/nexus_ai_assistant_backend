@@ -33,21 +33,24 @@ _TRIVIAL = {
 }
 
 _SYSTEM = """You are the Clarifier. You run BEFORE an AI assistant answers, and you
-decide whether the assistant should ask the user ONE clarifying question first.
+decide whether the assistant should ask the user one or more clarifying questions
+first.
 
-Read the message and judge the user's INTENT. If the intent is underspecified — a
-key detail is missing and the best answer would differ a LOT depending on it — ask
-ONE targeted question with concrete options. This applies to ANY domain, not just
-code: writing, design, planning, recommendations, analysis, math, cooking, travel…
+Read the message and judge the user's INTENT. Identify EVERY key detail that is
+underspecified — where the best answer would differ a LOT depending on the choice —
+and ask a SHORT question for each. A single request often has SEVERAL missing
+details; ask about each one (at most 4, most important first). This applies to ANY
+domain: code, writing, design, planning, documents, analysis, math, cooking, travel…
 
-Ask when the request is genuinely ambiguous, for example:
-- "write a program to reverse a string" → which programming language?
-- "translate this" → which target language?
-- "design a logo" → what style / for what brand?
-- "plan a trip" → destination, dates, budget?
-- "recommend a laptop" → budget and main use?
-- "write an essay" → topic, length, tone?
-- "make it better" → better in what way?
+Examples (note how one request can need several questions):
+- "write a program to remove spaces from a string, and give me a document" →
+  (1) which programming language? (2) remove which spaces — all spaces, only
+  leading/trailing, or all whitespace? (3) which document format — Word, PDF,
+  Markdown?
+- "translate this and format it nicely" → target language? + output format?
+- "design a logo" → what style? + for what brand/industry?
+- "plan a trip" → destination? + dates? + budget?
+- "write an essay" → topic? + length? + tone?
 
 Do NOT ask when:
 - it's a greeting, thanks, or small talk.
@@ -57,16 +60,18 @@ Do NOT ask when:
 - one obvious default clearly satisfies it, or the user wants your judgement
   ("you decide", "anything", "surprise me").
 
-Do NOT manufacture ambiguity. Assume the common, present-day interpretation. If a
-reasonable person would confidently know what is being asked, answer it — only ask
-when you are genuinely unsure what the user wants.
+Do NOT manufacture ambiguity. Assume the common, present-day interpretation, and ask
+ONLY about details that genuinely change the answer. If a reasonable person would
+confidently know what is being asked, answer it.
 
-When you ask, give 2-4 concrete, specific options tailored to the request.
+Each question: give 2-4 concrete, specific options tailored to the request.
 
 Respond with STRICT JSON and nothing else:
 {"clarify": false}
 OR
-{"clarify": true, "question": {"header": "<label, <=14 chars>", "question": "<one specific question>", "multi_select": false, "options": [{"label": "<short choice>", "description": "<what it means>"}]}}"""
+{"clarify": true, "questions": [
+  {"header": "<label, <=14 chars>", "question": "<one specific question>", "multi_select": false, "options": [{"label": "<short choice>", "description": "<what it means>"}]}
+]}"""
 
 
 def _looks_trivial(text: str) -> bool:
@@ -102,19 +107,16 @@ _CODE_RE2 = re.compile(
     re.I,
 )
 
-_LANGUAGE_QUESTION = {
-    "clarify": True,
-    "question": {
-        "header": "Language",
-        "question": "Which programming language should I use?",
-        "multi_select": False,
-        "options": [
-            {"label": "Python", "description": "Clear and concise; good default"},
-            {"label": "JavaScript", "description": "Web / Node.js"},
-            {"label": "Java", "description": "Typed; enterprise / Android"},
-            {"label": "C++", "description": "Systems / performance"},
-        ],
-    },
+_LANGUAGE_Q = {
+    "header": "Language",
+    "question": "Which programming language should I use?",
+    "multi_select": False,
+    "options": [
+        {"label": "Python", "description": "Clear and concise; good default"},
+        {"label": "JavaScript", "description": "Web / Node.js"},
+        {"label": "Java", "description": "Typed; enterprise / Android"},
+        {"label": "C++", "description": "Systems / performance"},
+    ],
 }
 
 
@@ -123,6 +125,78 @@ def _needs_language(text: str) -> bool:
     if _LANG_RE.search(text):
         return False
     return bool(_CODE_RE.search(text) or _CODE_RE2.search(text))
+
+
+def _is_language_question(q: dict) -> bool:
+    h = str(q.get("header", "")).lower()
+    qt = str(q.get("question", "")).lower()
+    return "language" in h or "programming language" in qt
+
+
+# ── Deterministic fast-path #2: a document is wanted but no format named ─────
+# Like the language rule, this must NOT depend on the (flaky) LLM: when the user
+# asks for a downloadable document/file without naming a format, always ask which.
+
+# A specific export format IS named → no need to ask.
+_FORMAT_NAMED_RE = re.compile(
+    r"\.docx|\bdocx\b|word document|word format|word file|\bpdf\b|\.pdf|"
+    r"\bxlsx\b|\bexcel\b|spreadsheet|\bcsv\b|power ?point|\bpptx\b|slide deck|"
+    r"\bslides\b|markdown|\.md\b|\.txt|text file|plain text|\bzip\b",
+    re.I,
+)
+# A request to PRODUCE a document / file (not "analyse this document").
+_DOC_WANT_RE = re.compile(
+    r"\b(give|make|create|generate|write|produce|prepare|want|need|provide|send|"
+    r"build|draft)\b.{0,30}\b(document|\bdoc\b|file|report|write[- ]?up|"
+    r"hand[- ]?out|resume|cv|cover letter|letter|essay|paper|pdf)\b"
+    r"|\bdownloadable\b|\bexport\b|\bas a (document|file|report|pdf)\b"
+    r"|\bdownload\b.{0,20}\b(document|file|copy|version)\b",
+    re.I | re.S,
+)
+
+_DOC_FORMAT_Q = {
+    "header": "Doc format",
+    "question": "Which document format would you like to download?",
+    "multi_select": False,
+    "options": [
+        {"label": "Word (.docx)", "description": "Editable Word document"},
+        {"label": "PDF", "description": "Portable, print-ready"},
+        {"label": "Markdown", "description": "Plain .md with formatting"},
+        {"label": "Text", "description": "Plain .txt"},
+    ],
+}
+
+
+def _needs_doc_format(text: str) -> bool:
+    """A request for a downloadable document that doesn't name a format."""
+    if _FORMAT_NAMED_RE.search(text):
+        return False
+    return bool(_DOC_WANT_RE.search(text))
+
+
+def _is_format_question(q: dict) -> bool:
+    h = str(q.get("header", "")).lower()
+    qt = str(q.get("question", "")).lower()
+    return "format" in h or "format" in qt
+
+
+def _clean_question(q: dict) -> Optional[dict]:
+    """Validate + normalize one question; None if it has no prompt or <2 options."""
+    if not isinstance(q, dict):
+        return None
+    options = [
+        {"label": str(o.get("label", "")).strip()[:60],
+         "description": str(o.get("description", "")).strip()[:180]}
+        for o in (q.get("options") or []) if str(o.get("label", "")).strip()
+    ][:4]
+    if not str(q.get("question", "")).strip() or len(options) < 2:
+        return None
+    return {
+        "header": str(q.get("header") or "Clarify").strip()[:16] or "Clarify",
+        "question": str(q["question"]).strip()[:300],
+        "multi_select": bool(q.get("multi_select", False)),
+        "options": options,
+    }
 
 
 def _extract_json(raw: str) -> Optional[dict]:
@@ -145,23 +219,19 @@ async def assess_clarification(
     owner_id: Optional[int] = None,
     model: Optional[str] = None,
 ) -> dict:
-    """Return {"clarify": False} or {"clarify": True, "question": {...}}."""
+    """Return {"clarify": bool, "questions": [{...}, ...]} — a request can be
+    ambiguous in several ways, so this may carry more than one question."""
     text = (message or "").strip()
     if _looks_trivial(text):
-        return {"clarify": False}
+        return {"clarify": False, "questions": []}
 
-    # Deterministic fast-path (spec's canonical case): a code request with no
-    # language named ALWAYS blocks to ask which language — no LLM, no latency.
-    if _needs_language(text):
-        logger.info("[Clarifier] code request without a language → ask language")
-        return _LANGUAGE_QUESTION
+    needs_lang = _needs_language(text)
 
-    # A little recent context helps (e.g. a follow-up that's clear given history).
+    # LLM assessment: find every underspecified detail (up to 4 questions).
     context = ""
     if history:
         tail = [m for m in history if m.role in ("user", "assistant")][-4:]
         context = "\n".join(f"{m.role}: {m.content[:300]}" for m in tail)
-
     user_block = (f"Recent conversation:\n{context}\n\n" if context else "") + \
         f"New user message:\n{text}"
     msgs = [
@@ -169,34 +239,35 @@ async def assess_clarification(
         MessageDto(role="user", content=user_block),
     ]
 
+    questions: list[dict] = []
     try:
         result = await route_chat(db, msgs, requested_model=model,
-                                  temperature=0.0, max_tokens=400)
+                                  temperature=0.0, max_tokens=600)
         data = _extract_json(result.content)
+        if data and data.get("clarify"):
+            # Accept the new "questions" list, or a single legacy "question".
+            raw = data.get("questions")
+            if not raw and data.get("question"):
+                raw = [data["question"]]
+            for rq in (raw or [])[:4]:
+                cq = _clean_question(rq)
+                if cq:
+                    questions.append(cq)
     except Exception as e:
-        logger.warning(f"[Clarifier] assessment failed, skipping: {e}")
-        return {"clarify": False}
+        logger.warning(f"[Clarifier] assessment failed: {e}")
 
-    if not data or not data.get("clarify"):
-        return {"clarify": False}
+    # Guarantee the language question for a code request that named no language —
+    # the LLM is unreliable here, so this must not depend on the model's mood.
+    if needs_lang and not any(_is_language_question(q) for q in questions):
+        logger.info("[Clarifier] code request without a language → ask language")
+        questions.insert(0, _LANGUAGE_Q)
 
-    q = data.get("question") or {}
-    options = [
-        {"label": str(o.get("label", "")).strip()[:60],
-         "description": str(o.get("description", "")).strip()[:180]}
-        for o in (q.get("options") or []) if str(o.get("label", "")).strip()
-    ][:4]
+    # Guarantee the document-format question when a downloadable document is
+    # wanted but no format was named — also deterministic, so multi-question
+    # clarification doesn't silently collapse to one when the LLM call fails.
+    if _needs_doc_format(text) and not any(_is_format_question(q) for q in questions):
+        logger.info("[Clarifier] document wanted without a format → ask format")
+        questions.append(_DOC_FORMAT_Q)
 
-    # A valid blocking question needs a prompt and at least two real options.
-    if not str(q.get("question", "")).strip() or len(options) < 2:
-        return {"clarify": False}
-
-    return {
-        "clarify": True,
-        "question": {
-            "header": str(q.get("header") or "Clarify").strip()[:16] or "Clarify",
-            "question": str(q["question"]).strip()[:300],
-            "multi_select": bool(q.get("multi_select", False)),
-            "options": options,
-        },
-    }
+    questions = questions[:4]
+    return {"clarify": bool(questions), "questions": questions}

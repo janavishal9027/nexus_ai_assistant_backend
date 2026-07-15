@@ -183,6 +183,12 @@ async def _handle_ws_chat(session_id: str, data: dict, owner_id: int | None = No
         conversation_id, stream_result, citations = await agent_stream_chat(
             db, req, on_tool_event=on_tool_event, owner_id=owner_id)
 
+        # Reveal the conversation id up front so the client binds to THIS
+        # conversation even if generation fails mid-stream — a Retry then re-runs
+        # in the same chat instead of spawning a duplicate.
+        await ws_manager.send(session_id, {
+            "type": "conversation", "conversation_id": conversation_id})
+
         full = ""
         async for chunk in stream_result.stream:
             full += chunk
@@ -199,7 +205,7 @@ async def _handle_ws_chat(session_id: str, data: dict, owner_id: int | None = No
             conv.updated_at = datetime.now(timezone.utc)
         db.commit()
 
-        await memory_manager.auto_store(conversation_id, message, full)
+        await memory_manager.auto_store(conversation_id, message, full, owner_id=owner_id)
         await _publish_event("response_generated", correlation_id, conversation_id, session_id,
                              {"model": stream_result.display_name, "platform": stream_result.platform})
 
@@ -213,6 +219,14 @@ async def _handle_ws_chat(session_id: str, data: dict, owner_id: int | None = No
         await ws_manager.send_error_and_close(session_id, str(exc))
     except Exception as exc:
         logger.error(f"[AgentGateway] WS chat failed for {session_id}: {exc}", exc_info=True)
+        # If a conversation was already created before the failure, tell the
+        # client its id so a Retry reuses it instead of spawning a duplicate.
+        cid = getattr(exc, "conversation_id", None)
+        if cid is not None:
+            try:
+                await ws_manager.send(session_id, {"type": "conversation", "conversation_id": cid})
+            except Exception:
+                pass
         await ws_manager.send_error_and_close(session_id, "Generation failed")  # req 2.6
     finally:
         db.close()

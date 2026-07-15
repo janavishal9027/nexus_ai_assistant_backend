@@ -14,6 +14,8 @@ all of its chunks stay comparable. When pgvector is unavailable the column
 degrades to JSON and cosine similarity is computed in Python (see
 ``services/rag_retrieval.py``).
 """
+import os
+
 from sqlalchemy import (
     Column, Integer, String, Boolean, DateTime, Text, ForeignKey, JSON,
     LargeBinary,
@@ -22,6 +24,12 @@ from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
 
 from ..database import Base
+
+# Fixed dimension that gets an HNSW ANN index (the primary embedding model's dim;
+# mistral-embed = 1024). Chunks whose vector matches this dim are also written to
+# an indexed fixed-dim mirror column for fast approximate search; other dims use
+# the exact ``<=>`` scan on the unbounded column. See docs/…/05-vector-storage.md.
+ANN_DIM = int(os.getenv("RAG_ANN_DIM", "1024"))
 
 # Reuse the same pgvector detection the semantic-memory model uses so the whole
 # app agrees on whether real vector columns are available.
@@ -35,10 +43,17 @@ try:
         # openai 1536, …). Cannot carry an ANN index, but exact ``<=>`` search
         # is fast at personal-KB scale.
         return Column(_Vector(), nullable=True)
+
+    def _ann_vector_column():
+        # Fixed-dim mirror that CAN carry an HNSW index (Phase 3 scale).
+        return Column(_Vector(ANN_DIM), nullable=True)
 except Exception:  # pragma: no cover - only when pgvector is absent
     HAS_PGVECTOR = False
 
     def _vector_column():
+        return Column(JSON, nullable=True)
+
+    def _ann_vector_column():
         return Column(JSON, nullable=True)
 
 
@@ -98,8 +113,15 @@ class Document(Base):
     error = Column(Text, nullable=True)
     chunk_count = Column(Integer, default=0)
 
-    # Original file bytes, kept so the source can be re-viewed / re-ingested.
+    # Original file bytes. In the default "db" object-store mode they live here
+    # (BYTEA); in "s3" mode they live in MinIO/S3 and ``raw`` is NULL while
+    # ``storage_key`` holds the object key. See services/object_store.py.
     raw = Column(LargeBinary, nullable=True)
+    storage_key = Column(String(512), nullable=True)   # S3/MinIO key (Phase 4)
+
+    # SHA-256 of the raw bytes — lets ingestion skip re-embedding an unchanged
+    # re-upload (dedup). See services/rag_ingestion.py.
+    content_hash = Column(String(64), nullable=True, index=True)
 
     created_at = Column(DateTime, default=_now)
     updated_at = Column(DateTime, default=_now, onupdate=_now)
@@ -129,6 +151,25 @@ class DocumentChunk(Base):
     text = Column(Text, nullable=False)
     token_count = Column(Integer, nullable=True)
     embedding = _vector_column()
+    # Fixed-dim (ANN_DIM) mirror of ``embedding`` for chunks whose vector matches
+    # ANN_DIM — this column carries the HNSW index. NULL for other dimensions.
+    embedding_ann = _ann_vector_column()
+
+    # ── Semantic-embedding metadata (docs/semantic-embedding/05-vector-storage) ─
+    content_hash = Column(String(64), nullable=True, index=True)  # sha256(text) — dedup/cache
+    section = Column(String(512), nullable=True)     # heading path, e.g. "Auth ▸ Refresh"
+    page_number = Column(Integer, nullable=True)     # source page (PDF), if known
+    char_start = Column(Integer, nullable=True)      # offset into cleaned document text
+    char_end = Column(Integer, nullable=True)
+    # Parent/child: a searchable child points at the larger parent chunk that is
+    # returned to the LLM (small-to-big retrieval). Parents have is_parent=True
+    # and are excluded from search.
+    parent_chunk_id = Column(Integer, nullable=True, index=True)
+    is_parent = Column(Boolean, default=False, index=True)
+    # Which embedding space this vector lives in (per-chunk provenance, so a
+    # model change can be detected/migrated). e.g. "mistral/mistral-embed".
+    embedding_model = Column(String(160), nullable=True)
+    embedding_version = Column(String(64), nullable=True)
 
     created_at = Column(DateTime, default=_now)
 

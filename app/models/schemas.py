@@ -125,6 +125,9 @@ class ClarifyRequest(BaseModel):
 
 class ClarifyResponse(BaseModel):
     clarify: bool = False
+    # One or more clarifying questions (a request can be ambiguous in several
+    # ways). `question` stays populated with the first for backward compatibility.
+    questions: list[ClarifyQuestion] = []
     question: Optional[ClarifyQuestion] = None
 
 
@@ -154,6 +157,10 @@ class ExportRequest(BaseModel):
     content: str
     format: str
     title: Optional[str] = None
+    # When true (the in-response download), strip the chat wrapper so the file is
+    # just the requested document. When false (the Export menu), keep the whole
+    # AI response verbatim.
+    clean: bool = True
 
 
 # ─── RAG / Knowledge Base schemas ───────────────────────────────────────────

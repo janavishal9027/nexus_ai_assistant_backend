@@ -9,6 +9,8 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone
+from typing import Optional
+from pydantic import BaseModel
 
 from ..database import get_db
 from fastapi import Response
@@ -38,6 +40,45 @@ def _assert_conversation_access(db: Session, conversation_id, account_id: int) -
     conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
     if conv is not None and conv.owner_id is not None and conv.owner_id != account_id:
         raise HTTPException(status_code=403, detail="You do not have access to this conversation")
+
+
+class FeedbackRequest(BaseModel):
+    conversation_id: Optional[int] = None
+    message_index: Optional[int] = None
+    rating: int                          # +1 up, -1 down, 0 clears
+    user_text: Optional[str] = None
+    assistant_text: Optional[str] = None
+
+
+@router.post("/feedback")
+async def submit_feedback(body: FeedbackRequest, db: Session = Depends(get_db),
+                          account: Account = Depends(get_current_account)):
+    """Capture a 👍/👎 on an assistant message (Part D). One row per (owner,
+    conversation, message_index); the Reflector reads these to learn what lands."""
+    from ..models.db_models import MessageFeedback
+    _assert_conversation_access(db, body.conversation_id, account.id)
+    rating = 1 if body.rating > 0 else (-1 if body.rating < 0 else 0)
+    row = (db.query(MessageFeedback)
+           .filter(MessageFeedback.owner_id == account.id,
+                   MessageFeedback.conversation_id == body.conversation_id,
+                   MessageFeedback.message_index == body.message_index).first())
+    if rating == 0:                      # toggled off
+        if row:
+            db.delete(row)
+            db.commit()
+        return {"ok": True, "rating": 0}
+    if row:
+        row.rating = rating
+        row.assistant_text = body.assistant_text or row.assistant_text
+        row.user_text = body.user_text or row.user_text
+        row.updated_at = datetime.now(timezone.utc)
+    else:
+        db.add(MessageFeedback(
+            owner_id=account.id, conversation_id=body.conversation_id,
+            message_index=body.message_index, rating=rating,
+            user_text=body.user_text, assistant_text=body.assistant_text))
+    db.commit()
+    return {"ok": True, "rating": rating}
 
 
 @router.post("/send", response_model=ChatResponse)
@@ -82,7 +123,11 @@ async def clarify(request: ClarifyRequest, db: Session = Depends(get_db),
     except Exception as e:
         logger.warning(f"[Clarify] failed, proceeding without: {e}")
         return ClarifyResponse(clarify=False)
-    return ClarifyResponse(**result)
+    qs = result.get("questions") or []
+    # Keep the legacy single `question` populated with the first, for any client
+    # that still reads it.
+    return ClarifyResponse(clarify=bool(qs), questions=qs,
+                           question=qs[0] if qs else None)
 
 
 @router.post("/suggest", response_model=SuggestResponse)
@@ -126,7 +171,8 @@ async def export(request: ExportRequest, account: Account = Depends(get_current_
     from urllib.parse import quote
     try:
         data, mime, filename = export_document(
-            request.content, request.format, request.title or "document")
+            request.content, request.format, request.title or "document",
+            clean=request.clean)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -161,6 +207,14 @@ async def stream_message(request: ChatRequest, db: Session = Depends(get_db),
         async def event_generator():
             full_content = ""
             try:
+                # Reveal the conversation id up front so the client binds to THIS
+                # conversation even if generation fails mid-stream — a Retry then
+                # re-runs in the same chat instead of spawning a duplicate.
+                yield json.dumps({
+                    "content": "",
+                    "conversationId": conversation_id,
+                    "done": False,
+                })
                 async for chunk in result.stream:
                     full_content += chunk
                     yield json.dumps({
@@ -207,7 +261,9 @@ async def stream_message(request: ChatRequest, db: Session = Depends(get_db),
                 return
             except Exception as e:
                 logger.error(f"[ChatRouter/Stream] Error in stream generator: {e}", exc_info=True)
-                yield json.dumps({"error": str(e), "done": True})
+                # Carry the conversation id on the error too, so a Retry reuses
+                # this conversation rather than creating a new one.
+                yield json.dumps({"error": str(e), "conversationId": conversation_id, "done": True})
 
         return EventSourceResponse(event_generator())
 
@@ -222,8 +278,11 @@ async def stream_message(request: ChatRequest, db: Session = Depends(get_db),
         # Capture the message now: Python clears `e` when this except block
         # exits, but error_gen runs later (while streaming the response).
         err_msg = str(e)
+        # If the conversation was already created before the failure, surface its
+        # id so a Retry reuses it instead of spawning a duplicate chat.
+        err_cid = getattr(e, "conversation_id", None)
 
         async def error_gen():
-            yield json.dumps({"error": err_msg, "done": True})
+            yield json.dumps({"error": err_msg, "conversationId": err_cid, "done": True})
 
         return EventSourceResponse(error_gen())

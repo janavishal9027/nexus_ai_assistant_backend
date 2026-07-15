@@ -23,16 +23,56 @@ import logging
 import math
 from typing import Optional
 
-from sqlalchemy import func, text as sql_text
+from sqlalchemy import func, or_, text as sql_text
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..models.schemas import MessageDto
-from ..models.rag_models import DocumentChunk, Document, KnowledgeBase, HAS_PGVECTOR
+from ..models.rag_models import DocumentChunk, Document, KnowledgeBase, HAS_PGVECTOR, ANN_DIM
 from ..providers.embeddings import embedding_provider_for_kb, INPUT_QUERY
 from ..providers.reranker import resolve_reranker
+from .rag_query import rewrite_query
+from .rag_observability import RagTrace
+from . import rag_cache
 
 logger = logging.getLogger(__name__)
+
+
+def _expand_parents(db: Session, chunks: list[DocumentChunk]) -> list[DocumentChunk]:
+    """Small-to-big: replace each searched *child* with its larger *parent*
+    chunk (the whole section) for richer LLM context, de-duplicated by parent so
+    multiple children of one section collapse into a single block. Children with
+    no parent (flat chunking / legacy rows) pass through unchanged. Rank order is
+    preserved (first occurrence wins)."""
+    parent_ids = {c.parent_chunk_id for c in chunks if getattr(c, "parent_chunk_id", None)}
+    parents: dict[int, DocumentChunk] = {}
+    if parent_ids:
+        for p in db.query(DocumentChunk).filter(DocumentChunk.id.in_(parent_ids)).all():
+            parents[p.id] = p
+    out: list[DocumentChunk] = []
+    seen: set[int] = set()
+    for c in chunks:
+        target = parents.get(getattr(c, "parent_chunk_id", None) or -1, c)
+        if target.id in seen:
+            continue
+        seen.add(target.id)
+        out.append(target)
+    return out
+
+
+def _target_id(c: DocumentChunk) -> int:
+    return getattr(c, "parent_chunk_id", None) or c.id
+
+
+def _scope_owner(query, owner_id: Optional[int]):
+    """Defense-in-depth ACL: restrict to the caller's own chunks (plus any
+    shared, owner-less rows) directly in the SQL — never rely solely on the
+    upstream KB/conversation ownership check. No-op when owner_id is unknown."""
+    if owner_id is None:
+        return query
+    return query.filter(
+        or_(DocumentChunk.owner_id == owner_id, DocumentChunk.owner_id.is_(None))
+    )
 
 
 GROUNDED_SYSTEM = """You are a knowledge-base assistant. Answer the user's \
@@ -47,30 +87,43 @@ Context sources:
 
 # ─── Individual retrievers ──────────────────────────────────────────────────
 
-def semantic_search(db: Session, kb_id: int, query_vec: list[float], limit: int) -> list[DocumentChunk]:
+def semantic_search(db: Session, kb_id: int, query_vec: list[float], limit: int,
+                    owner_id: Optional[int] = None) -> list[DocumentChunk]:
     """Vector nearest-neighbours within a KB, best-first. Uses pgvector's
     cosine distance operator when available, else a Python fallback."""
     if not query_vec:
         return []
     if HAS_PGVECTOR:
+        # Fast path: HNSW ANN on the fixed-dim mirror column when the query's
+        # dim matches ANN_DIM. Any failure (missing column/index) → exact scan.
+        if get_settings().rag_ann_enabled and len(query_vec) == ANN_DIM:
+            try:
+                dist = DocumentChunk.embedding_ann.cosine_distance(query_vec)
+                q = (
+                    db.query(DocumentChunk)
+                    .filter(DocumentChunk.knowledge_base_id == kb_id)
+                    .filter(DocumentChunk.embedding_ann.isnot(None))
+                )
+                return _scope_owner(q, owner_id).order_by(dist.asc()).limit(limit).all()
+            except Exception as exc:
+                logger.warning(f"[RAG] ANN search failed ({exc}); using exact scan")
+                db.rollback()
         distance = DocumentChunk.embedding.cosine_distance(query_vec)
-        rows = (
+        q = (
             db.query(DocumentChunk)
             .filter(DocumentChunk.knowledge_base_id == kb_id)
             .filter(DocumentChunk.embedding.isnot(None))
-            .order_by(distance.asc())
-            .limit(limit)
-            .all()
         )
-        return rows
-    return _semantic_python(db, kb_id, query_vec, limit)
+        return _scope_owner(q, owner_id).order_by(distance.asc()).limit(limit).all()
+    return _semantic_python(db, kb_id, query_vec, limit, owner_id)
 
 
-def _semantic_python(db: Session, kb_id: int, query_vec: list[float], limit: int) -> list[DocumentChunk]:
+def _semantic_python(db: Session, kb_id: int, query_vec: list[float], limit: int,
+                     owner_id: Optional[int] = None) -> list[DocumentChunk]:
     """Brute-force cosine in Python for the JSON-column (no-pgvector) mode."""
     rows = (
-        db.query(DocumentChunk)
-        .filter(DocumentChunk.knowledge_base_id == kb_id)
+        _scope_owner(db.query(DocumentChunk)
+                     .filter(DocumentChunk.knowledge_base_id == kb_id), owner_id)
         .limit(5000)
         .all()
     )
@@ -87,7 +140,8 @@ def _semantic_python(db: Session, kb_id: int, query_vec: list[float], limit: int
     return [r for _, r in scored[:limit]]
 
 
-def keyword_search(db: Session, kb_id: int, query: str, limit: int) -> list[DocumentChunk]:
+def keyword_search(db: Session, kb_id: int, query: str, limit: int,
+                   owner_id: Optional[int] = None) -> list[DocumentChunk]:
     """Postgres full-text keyword match within a KB, ranked by ts_rank. Backed
     by the functional GIN index on to_tsvector('english', text)."""
     query = (query or "").strip()
@@ -96,26 +150,24 @@ def keyword_search(db: Session, kb_id: int, query: str, limit: int) -> list[Docu
     tsv = func.to_tsvector("english", DocumentChunk.text)
     tsq = func.plainto_tsquery("english", query)
     try:
-        rows = (
+        q = (
             db.query(DocumentChunk)
             .filter(DocumentChunk.knowledge_base_id == kb_id)
+            .filter(DocumentChunk.is_parent.isnot(True))   # search children, not parents
             .filter(tsv.op("@@")(tsq))
-            .order_by(func.ts_rank(tsv, tsq).desc())
-            .limit(limit)
-            .all()
         )
-        return rows
+        return _scope_owner(q, owner_id).order_by(func.ts_rank(tsv, tsq).desc()).limit(limit).all()
     except Exception as exc:  # pragma: no cover - FTS should always be present
         logger.warning(f"[RAG] Keyword search failed ({exc}); using ILIKE fallback")
         db.rollback()
         like = f"%{query}%"
-        return (
+        q = (
             db.query(DocumentChunk)
             .filter(DocumentChunk.knowledge_base_id == kb_id)
+            .filter(DocumentChunk.is_parent.isnot(True))
             .filter(DocumentChunk.text.ilike(like))
-            .limit(limit)
-            .all()
         )
+        return _scope_owner(q, owner_id).limit(limit).all()
 
 
 # ─── Fusion ─────────────────────────────────────────────────────────────────
@@ -137,44 +189,75 @@ def reciprocal_rank_fusion(
 
 # ─── Orchestration ──────────────────────────────────────────────────────────
 
-async def retrieve(db: Session, kb: KnowledgeBase, query: str, owner_id: Optional[int]) -> list[dict]:
-    """Run the full hybrid pipeline and return the final ranked chunks as dicts
-    carrying their source document metadata (for citations)."""
+async def retrieve(
+    db: Session, kb: KnowledgeBase, query: str, owner_id: Optional[int],
+    history: Optional[list[MessageDto]] = None,
+) -> list[dict]:
+    """Full hybrid pipeline: (rewrite →) embed → dense∥sparse → RRF → rerank →
+    parent-expand → dicts with source metadata (for citations)."""
     settings = get_settings()
+    trace = RagTrace("kb")
+    trace.note("kb", kb.id)
+
+    with trace.stage("rewrite"):
+        q = await rewrite_query(db, query, history, owner_id)
+
     provider = embedding_provider_for_kb(
         db, owner_id, kb.embedding_platform, kb.embedding_model, kb.embedding_dim,
     )
-    query_vec = await provider.embed_one(query, input_type=INPUT_QUERY)
+    with trace.stage("embed"):
+        query_vec = await provider.embed_one(q, input_type=INPUT_QUERY)
+
+    # Semantic cache: reuse the chunk set for an equivalent recent query.
+    scope = f"kb:{kb.id}"
+    if settings.rag_semantic_cache_enabled and query_vec:
+        cached = rag_cache.get(scope, q, query_vec,
+                               settings.rag_semantic_cache_threshold,
+                               settings.rag_semantic_cache_ttl_s)
+        if cached is not None:
+            trace.note("cache", "hit")
+            trace.count("final", len(cached))
+            trace.done()
+            return cached
 
     # Run both searches on ONE worker thread (sequentially) so the sync DB work
-    # stays off the event loop without sharing the Session across threads (a
-    # SQLAlchemy Session is not safe for concurrent use).
+    # stays off the event loop without sharing the Session across threads.
     def _search_both():
         return (
-            semantic_search(db, kb.id, query_vec, settings.rag_semantic_top_n),
-            keyword_search(db, kb.id, query, settings.rag_keyword_top_n),
+            semantic_search(db, kb.id, query_vec, settings.rag_semantic_top_n, owner_id),
+            keyword_search(db, kb.id, q, settings.rag_keyword_top_n, owner_id),
         )
+    with trace.stage("search"):
+        sem, kw = await asyncio.to_thread(_search_both)
 
-    sem, kw = await asyncio.to_thread(_search_both)
-
-    fused = reciprocal_rank_fusion([sem, kw], settings.rag_rrf_k, settings.rag_fusion_top_k)
+    # Fuse to a wide candidate set so the reranker has material to work with.
+    fused = reciprocal_rank_fusion([sem, kw], settings.rag_rrf_k, settings.rag_candidate_top_k)
+    trace.count("candidates", len(fused))
     if not fused:
+        trace.done()
         return []
 
-    # Optional rerank (no-op by default) → final top 5–8.
     reranker = resolve_reranker(db, owner_id)
-    docs_text = [c.text for c, _ in fused]
-    order = await reranker.rerank(query, docs_text, settings.rag_final_top_k)
+    with trace.stage("rerank"):
+        order = await reranker.rerank(q, [c.text for c, _ in fused], settings.rag_final_top_k)
+    trace.note("reranker", reranker.name)
     final = [(fused[i][0], fused[i][1]) for i in order if 0 <= i < len(fused)]
 
-    # Resolve source filenames in one query.
-    doc_ids = {c.document_id for c, _ in final}
+    # Best score per parent/self, then small-to-big parent expansion (+ dedup).
+    best: dict[int, float] = {}
+    for c, s in final:
+        tid = _target_id(c)
+        best[tid] = max(best.get(tid, 0.0), float(s))
+    expanded = await asyncio.to_thread(_expand_parents, db, [c for c, _ in final])
+    trace.count("final", len(expanded))
+
+    doc_ids = {c.document_id for c in expanded}
     names = dict(
         db.query(Document.id, Document.filename).filter(Document.id.in_(doc_ids)).all()
     ) if doc_ids else {}
 
     results = []
-    for idx, (chunk, score) in enumerate(final, 1):
+    for idx, chunk in enumerate(expanded, 1):
         results.append({
             "index": idx,
             "chunk_id": chunk.id,
@@ -182,29 +265,43 @@ async def retrieve(db: Session, kb: KnowledgeBase, query: str, owner_id: Optiona
             "document_name": names.get(chunk.document_id, "document"),
             "ordinal": chunk.ordinal,
             "text": chunk.text,
-            "score": round(float(score), 6),
+            "section": getattr(chunk, "section", None),
+            "page_number": getattr(chunk, "page_number", None),
+            "score": round(best.get(chunk.id, 0.0), 6),
         })
+    if settings.rag_semantic_cache_enabled and query_vec:
+        rag_cache.put(scope, q, query_vec, results, settings.rag_semantic_cache_size)
+    trace.done()
     return results
 
 
 # ─── Per-conversation RAG (A.3) ─────────────────────────────────────────────
 
 def _semantic_search_conv(db: Session, conversation_id: int, query_vec: list[float],
-                          limit: int) -> list[DocumentChunk]:
+                          limit: int, owner_id: Optional[int] = None) -> list[DocumentChunk]:
     if not query_vec:
         return []
     if HAS_PGVECTOR:
+        if get_settings().rag_ann_enabled and len(query_vec) == ANN_DIM:
+            try:
+                dist = DocumentChunk.embedding_ann.cosine_distance(query_vec)
+                q = (db.query(DocumentChunk)
+                     .filter(DocumentChunk.conversation_id == conversation_id)
+                     .filter(DocumentChunk.embedding_ann.isnot(None)))
+                return _scope_owner(q, owner_id).order_by(dist.asc()).limit(limit).all()
+            except Exception as exc:
+                logger.warning(f"[RAG] ANN conv search failed ({exc}); using exact scan")
+                db.rollback()
         distance = DocumentChunk.embedding.cosine_distance(query_vec)
-        return (
+        q = (
             db.query(DocumentChunk)
             .filter(DocumentChunk.conversation_id == conversation_id)
             .filter(DocumentChunk.embedding.isnot(None))
-            .order_by(distance.asc())
-            .limit(limit)
-            .all()
         )
-    rows = (db.query(DocumentChunk)
-            .filter(DocumentChunk.conversation_id == conversation_id).limit(4000).all())
+        return _scope_owner(q, owner_id).order_by(distance.asc()).limit(limit).all()
+    rows = (_scope_owner(db.query(DocumentChunk)
+            .filter(DocumentChunk.conversation_id == conversation_id), owner_id)
+            .limit(4000).all())
     qn = math.sqrt(sum(v * v for v in query_vec)) or 1.0
     scored = []
     for r in rows:
@@ -219,26 +316,27 @@ def _semantic_search_conv(db: Session, conversation_id: int, query_vec: list[flo
 
 
 def _keyword_search_conv(db: Session, conversation_id: int, query: str,
-                         limit: int) -> list[DocumentChunk]:
+                         limit: int, owner_id: Optional[int] = None) -> list[DocumentChunk]:
     query = (query or "").strip()
     if not query:
         return []
     tsv = func.to_tsvector("english", DocumentChunk.text)
     tsq = func.plainto_tsquery("english", query)
     try:
-        return (
+        q = (
             db.query(DocumentChunk)
             .filter(DocumentChunk.conversation_id == conversation_id)
+            .filter(DocumentChunk.is_parent.isnot(True))
             .filter(tsv.op("@@")(tsq))
-            .order_by(func.ts_rank(tsv, tsq).desc())
-            .limit(limit)
-            .all()
         )
+        return _scope_owner(q, owner_id).order_by(func.ts_rank(tsv, tsq).desc()).limit(limit).all()
     except Exception:
         db.rollback()
-        return (db.query(DocumentChunk)
-                .filter(DocumentChunk.conversation_id == conversation_id)
-                .filter(DocumentChunk.text.ilike(f"%{query}%")).limit(limit).all())
+        q = (db.query(DocumentChunk)
+             .filter(DocumentChunk.conversation_id == conversation_id)
+             .filter(DocumentChunk.is_parent.isnot(True))
+             .filter(DocumentChunk.text.ilike(f"%{query}%")))
+        return _scope_owner(q, owner_id).limit(limit).all()
 
 
 def conversation_has_docs(db: Session, conversation_id: int) -> bool:
@@ -251,7 +349,7 @@ def conversation_has_docs(db: Session, conversation_id: int) -> bool:
 
 async def retrieve_conversation_context(
     db: Session, conversation_id: int, query: str, owner_id: Optional[int],
-    token_budget: int = 1800,
+    token_budget: int = 1800, history: Optional[list[MessageDto]] = None,
 ) -> tuple[str, list[str]]:
     """Hybrid-retrieve the most relevant chunks of this conversation's attached
     documents for the query, compressed to a token budget. Returns (context, sources).
@@ -260,6 +358,11 @@ async def retrieve_conversation_context(
         return "", []
 
     settings = get_settings()
+    trace = RagTrace("conv")
+    trace.note("conv", conversation_id)
+    with trace.stage("rewrite"):
+        q = await rewrite_query(db, query, history, owner_id)
+
     # Embed the query in the same space the conversation's docs were embedded in.
     doc = (db.query(Document)
            .filter(Document.conversation_id == conversation_id,
@@ -271,34 +374,53 @@ async def retrieve_conversation_context(
         getattr(doc, "embedding_model", None),
         getattr(doc, "embedding_dim", None),
     )
-    query_vec = await provider.embed_one(query, input_type=INPUT_QUERY)
+    with trace.stage("embed"):
+        query_vec = await provider.embed_one(q, input_type=INPUT_QUERY)
+
+    scope = f"conv:{conversation_id}"
+    if settings.rag_semantic_cache_enabled and query_vec:
+        cached = rag_cache.get(scope, q, query_vec,
+                               settings.rag_semantic_cache_threshold,
+                               settings.rag_semantic_cache_ttl_s)
+        if cached is not None:
+            trace.note("cache", "hit")
+            trace.done()
+            return cached
 
     def _search():
         return (
-            _semantic_search_conv(db, conversation_id, query_vec, settings.rag_semantic_top_n),
-            _keyword_search_conv(db, conversation_id, query, settings.rag_keyword_top_n),
+            _semantic_search_conv(db, conversation_id, query_vec, settings.rag_semantic_top_n, owner_id),
+            _keyword_search_conv(db, conversation_id, q, settings.rag_keyword_top_n, owner_id),
         )
-    sem, kw = await asyncio.to_thread(_search)
+    with trace.stage("search"):
+        sem, kw = await asyncio.to_thread(_search)
 
-    fused = reciprocal_rank_fusion([sem, kw], settings.rag_rrf_k, settings.rag_fusion_top_k)
+    fused = reciprocal_rank_fusion([sem, kw], settings.rag_rrf_k, settings.rag_candidate_top_k)
+    trace.count("candidates", len(fused))
     if not fused:
+        trace.done()
         return "", []
 
     reranker = resolve_reranker(db, owner_id)
-    order = await reranker.rerank(query, [c.text for c, _ in fused], settings.rag_final_top_k)
+    with trace.stage("rerank"):
+        order = await reranker.rerank(q, [c.text for c, _ in fused], settings.rag_final_top_k)
+    trace.note("reranker", reranker.name)
     final = [fused[i][0] for i in order if 0 <= i < len(fused)]
 
-    # Compressor: keep the best chunks until the token budget (~4 chars/token).
+    # Small-to-big parent expansion (+ dedup), then compress to a token budget.
+    picked_src = await asyncio.to_thread(_expand_parents, db, final)
     picked: list[DocumentChunk] = []
     used = 0
-    for ch in final:
+    for ch in picked_src:
         cost = max(1, len(ch.text) // 4)
         if picked and used + cost > token_budget:
             break
         picked.append(ch)
         used += cost
     if not picked:
+        trace.done()
         return "", []
+    trace.count("final", len(picked))
 
     doc_ids = {c.document_id for c in picked}
     names = dict(db.query(Document.id, Document.filename)
@@ -309,7 +431,21 @@ async def retrieve_conversation_context(
         lines.append(f"[{i}] (from {name})\n{ch.text}")
         if name not in sources:
             sources.append(name)
-    return "\n\n".join(lines), sources
+    payload = ("\n\n".join(lines), sources)
+    if settings.rag_semantic_cache_enabled and query_vec:
+        rag_cache.put(scope, q, query_vec, payload, settings.rag_semantic_cache_size)
+    trace.done()
+    return payload
+
+
+def _source_label(c: dict) -> str:
+    """Human/LLM-readable citation label: 'file.pdf · p.4 · Auth ▸ Refresh'."""
+    bits = [str(c.get("document_name") or "document")]
+    if c.get("page_number"):
+        bits.append(f"p.{c['page_number']}")
+    if c.get("section"):
+        bits.append(str(c["section"]))
+    return " · ".join(bits)
 
 
 def build_grounded_messages(
@@ -318,7 +454,7 @@ def build_grounded_messages(
     """Construct the LLM message list: a grounded system prompt with numbered
     sources, optional prior turns, then the user's question."""
     context = "\n\n".join(
-        f"[{c['index']}] (source: {c['document_name']})\n{c['text']}" for c in chunks
+        f"[{c['index']}] (source: {_source_label(c)})\n{c['text']}" for c in chunks
     ) or "(no relevant sources found)"
     messages = [MessageDto(role="system", content=GROUNDED_SYSTEM.format(context=context))]
     if history:

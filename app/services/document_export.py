@@ -84,7 +84,10 @@ def _parse_blocks(md: str) -> list[dict]:
                and not _LIST_RE.match(lines[i])):
             para.append(lines[i].strip())
             i += 1
-        blocks.append({"type": "para", "text": " ".join(para)})
+        # Keep the source line breaks (single newlines) rather than collapsing
+        # them into one run-on line — many answers put structured content (e.g.
+        # "Label: values" rows) on their own lines and rely on that layout.
+        blocks.append({"type": "para", "text": "\n".join(para)})
     return blocks
 
 
@@ -106,13 +109,123 @@ def _strip_md(text: str) -> str:
     return text.strip()
 
 
+def _docx_add_runs(paragraph, text: str) -> None:
+    """Append text to a docx paragraph, rendering inline **bold** as bold runs
+    (other markers are stripped). Keeps emphasis instead of flattening it."""
+    for seg in re.split(r"(\*\*.+?\*\*)", text):
+        if not seg:
+            continue
+        if len(seg) > 4 and seg.startswith("**") and seg.endswith("**"):
+            paragraph.add_run(_strip_md(seg[2:-2])).bold = True
+        else:
+            paragraph.add_run(_strip_md(seg))
+
+
+def _norm(s: str) -> str:
+    """Normalize for comparison (lowercase alphanumerics only)."""
+    return re.sub(r"[^a-z0-9]+", "", _strip_md(s or "").lower())
+
+
+def _skip_title(blocks: list[dict], title: str) -> bool:
+    """True when the content already opens with the title heading, so the
+    generator shouldn't add a second (duplicate) title on top."""
+    return bool(blocks and blocks[0]["type"] == "heading"
+                and _norm(blocks[0]["text"]) == _norm(title))
+
+
 def _safe_title(title: str) -> str:
     title = re.sub(r"[^\w\-. ]+", "", (title or "document")).strip() or "document"
     return title[:60]
 
 
+# ─── Strip the chat wrapper so the file is JUST the document ─────────────────
+# Answers arrive wrapped in chat affordances — a "download with the Export
+# button" note, a trailing "Follow-ups" section, and conversational preamble /
+# a title that names the file format. None of that belongs in the downloaded
+# file. Every model wraps differently, so we normalize on export.
+
+_FOLLOWUP_HEAD_RE = re.compile(
+    r"^\s*#{0,6}\s*\*{0,2}\s*follow[\s\-]?ups?\s*\*{0,2}\s*:?\s*$", re.IGNORECASE)
+_FORMAT_PAREN_RE = re.compile(
+    r"\((?:markdown|md|word|docx|pdf|excel|xlsx|csv|text|txt|powerpoint|pptx)\)\s*$",
+    re.IGNORECASE)
+_FRAMING_RE = re.compile(
+    r"^\s*(here(?:'?s| is| you go)|sure[,!.: ]|certainly[,!.: ]|of course[,!.: ]|"
+    r"absolutely[,!.: ]|below is\b|i(?:'?ve| have) (?:created|prepared|revised|"
+    r"updated|drafted|put together))",
+    re.IGNORECASE)
+_SEP_ONLY_RE = re.compile(r"^\s*([-*_])\1{2,}\s*$")  # --- *** ___
+
+
+def _is_download_note(line: str) -> bool:
+    low = line.lower()
+    if ("beneath this message" in low or "beneath your message" in low
+            or "below this message" in low):
+        return True
+    return ("button" in low) and ("download" in low or "export" in low)
+
+
+def _clean_for_export(md: str) -> str:
+    """Drop the assistant's chat wrapper (download-button note, Follow-ups
+    section, conversational preamble / format-title) so only the document
+    remains. Falls back to the original if cleaning would empty it."""
+    lines = (md or "").split("\n")
+
+    # Cut a trailing "Follow-ups" section (its heading → end of message).
+    for i, ln in enumerate(lines):
+        if _FOLLOWUP_HEAD_RE.match(ln):
+            lines = lines[:i]
+            break
+
+    # Remove any "download via the Export button" affordance line(s).
+    lines = [ln for ln in lines if not _is_download_note(ln)]
+
+    # Trim leading blanks / separators / conversational framing / format titles.
+    while lines:
+        s = lines[0].strip()
+        bare = re.sub(r"^#{1,6}\s*", "", s).replace("*", "").strip()
+        if (not s or _SEP_ONLY_RE.match(s) or _FRAMING_RE.match(s)
+                or _FORMAT_PAREN_RE.search(bare)):
+            lines.pop(0)
+        else:
+            break
+
+    # Trim trailing blanks / separators.
+    while lines and (not lines[-1].strip() or _SEP_ONLY_RE.match(lines[-1].strip())):
+        lines.pop()
+
+    cleaned = "\n".join(lines).strip()
+    return cleaned or (md or "").strip()
+
+
+def _clean_title(title: str) -> str:
+    """Drop a trailing format tag like '(Markdown)' from a title/filename."""
+    return _FORMAT_PAREN_RE.sub("", title or "").strip() or (title or "")
+
+
+# The PDF core fonts are latin-1 only, so Unicode punctuation would otherwise
+# become "?" — transliterate the common ones (bullets, dashes, smart quotes,
+# non-breaking / thin spaces, arrows) to clean ASCII first.
+_TRANSLIT = {
+    0x2022: "-", 0x2023: "-", 0x25AA: "-", 0x25CF: "-", 0x2043: "-", 0x00B7: "-",
+    0x2014: "-", 0x2013: "-", 0x2011: "-", 0x2212: "-",       # dashes / minus
+    0x2018: "'", 0x2019: "'", 0x201A: "'", 0x2032: "'",       # single quotes
+    0x201C: '"', 0x201D: '"', 0x201E: '"', 0x2033: '"',       # double quotes
+    0x2026: "...", 0x2192: "->", 0x2190: "<-", 0x21D2: "=>", 0x21D0: "<=",
+    0x00A0: " ", 0x2009: " ", 0x202F: " ", 0x2007: " ", 0x200B: "",  # spaces
+    0x2013: "-", 0x2015: "-", 0xFE0F: "",
+    # math / comparison operators (would otherwise show as "?")
+    0x2264: "<=", 0x2265: ">=", 0x2260: "!=", 0x2248: "~=", 0x2261: "==",
+    0x00D7: "x", 0x00F7: "/", 0x00B1: "+/-", 0x221E: "inf", 0x221A: "sqrt",
+    0x00B0: " deg", 0x03BC: "u", 0x2211: "sum", 0x220F: "prod", 0x2208: "in",
+    0x2200: "for all", 0x2203: "exists", 0x2205: "empty", 0x2229: "and",
+    0x222A: "or", 0x00BD: "1/2", 0x00BC: "1/4", 0x00BE: "3/4", 0x2153: "1/3",
+    0x2154: "2/3", 0x2013: "-", 0x2032: "'", 0x2033: '"',
+}
+
+
 def _latin(s: str) -> str:
-    return s.encode("latin-1", "replace").decode("latin-1")
+    return (s or "").translate(_TRANSLIT).encode("latin-1", "replace").decode("latin-1")
 
 
 # ─── Format generators ──────────────────────────────────────────────────────
@@ -149,7 +262,9 @@ def _to_csv(content: str, title: str):
     else:
         for b in blocks:
             if b["type"] == "para":
-                w.writerow([_strip_md(b["text"])])
+                for ln in b["text"].split("\n"):
+                    if ln.strip():
+                        w.writerow([_strip_md(ln)])
             elif b["type"] == "list":
                 for x in b["items"]:
                     w.writerow([_strip_md(x)])
@@ -162,16 +277,27 @@ def _to_docx(content: str, title: str):
     import docx
     from docx.shared import Pt
     d = docx.Document()
-    d.add_heading(title, 0)
-    for b in _parse_blocks(content):
+    blocks = _parse_blocks(content)
+    if not _skip_title(blocks, title):
+        d.add_heading(title, 0)
+    for b in blocks:
         t = b["type"]
         if t == "heading":
             d.add_heading(_strip_md(b["text"]), min(b["level"], 4))
         elif t == "para":
-            d.add_paragraph(_strip_md(b["text"]))
+            # Preserve the answer's line breaks as line breaks in one paragraph
+            # (tight spacing) instead of merging them into a run-on block; render
+            # inline **bold** as real bold.
+            plines = [ln for ln in b["text"].split("\n") if ln.strip()]
+            if plines:
+                p = d.add_paragraph()
+                for idx, ln in enumerate(plines):
+                    if idx:
+                        p.add_run().add_break()
+                    _docx_add_runs(p, ln)
         elif t == "list":
             for x in b["items"]:
-                d.add_paragraph(_strip_md(x), style="List Bullet")
+                _docx_add_runs(d.add_paragraph(style="List Bullet"), x)
         elif t == "code":
             p = d.add_paragraph()
             run = p.add_run(b["text"])
@@ -192,17 +318,50 @@ def _to_docx(content: str, title: str):
             f"{title}.docx")
 
 
-def _pdf_write(pdf, h: float, text: str) -> None:
-    """Write a block to the PDF, hard-wrapping very long unbreakable tokens (so
-    fpdf can always place them) and never letting one line break the export."""
+def _pdf_write(pdf, h: float, text: str, markdown: bool = False) -> None:
+    """Write a block to the PDF, one source line per line (structure preserved),
+    hard-wrapping very long unbreakable tokens so fpdf can always place them.
+    With markdown=True, inline **bold** / __italic__ render as emphasis.
+
+    new_x/new_y are explicit: each line must return to the left margin and move
+    down, otherwise a second w=0 multi_cell starts at the right edge and fpdf
+    raises "not enough horizontal space" (which would silently drop the line)."""
+    from fpdf.enums import XPos, YPos
     for raw in (text or "").split("\n"):
         line = _latin(raw)
         # Insert a break opportunity inside tokens longer than ~90 chars.
         line = re.sub(r"(\S{90})", r"\1 ", line)
         try:
-            pdf.multi_cell(0, h, line if line else " ")
+            pdf.multi_cell(0, h, line if line else " ", markdown=markdown,
+                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         except Exception:
-            continue
+            # Retry without markdown if a stray '*'/'_' trips the parser.
+            try:
+                pdf.multi_cell(0, h, line if line else " ",
+                               new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            except Exception:
+                continue
+
+
+def _pdf_table(pdf, rows: list) -> None:
+    """Render a real bordered table (grid) with a bold header row. Falls back to
+    pipe-joined lines if fpdf can't fit the layout (e.g. a very wide table)."""
+    ncols = max((len(r) for r in rows), default=0)
+    if ncols == 0:
+        return
+    data = [[_latin(_strip_md(c)) for c in r] + [""] * (ncols - len(r))
+            for r in rows]
+    try:
+        with pdf.table(first_row_as_headings=True, text_align="LEFT",
+                       line_height=6) as table:
+            for r in data:
+                trow = table.row()
+                for cell in r:
+                    trow.cell(cell)
+    except Exception:
+        pdf.set_font("Helvetica", "", 9)
+        for r in rows:
+            _pdf_write(pdf, 5, " | ".join(_strip_md(c) for c in r))
 
 
 def _to_pdf(content: str, title: str):
@@ -210,10 +369,12 @@ def _to_pdf(content: str, title: str):
     pdf = FPDF()
     pdf.set_auto_page_break(True, margin=15)
     pdf.add_page()
-    pdf.set_font("Helvetica", "B", 16)
-    _pdf_write(pdf, 9, title)
-    pdf.ln(2)
-    for b in _parse_blocks(content):
+    blocks = _parse_blocks(content)
+    if not _skip_title(blocks, title):
+        pdf.set_font("Helvetica", "B", 16)
+        _pdf_write(pdf, 9, title)
+        pdf.ln(2)
+    for b in blocks:
         t = b["type"]
         if t == "heading":
             pdf.set_font("Helvetica", "B", max(11, 17 - b["level"]))
@@ -221,12 +382,13 @@ def _to_pdf(content: str, title: str):
             pdf.ln(1)
         elif t == "para":
             pdf.set_font("Helvetica", "", 11)
-            _pdf_write(pdf, 6, _strip_md(b["text"]))
+            # Raw text + markdown so inline **bold** renders; line breaks kept.
+            _pdf_write(pdf, 6, b["text"], markdown=True)
             pdf.ln(1)
         elif t == "list":
             pdf.set_font("Helvetica", "", 11)
             for x in b["items"]:
-                _pdf_write(pdf, 6, "-  " + _strip_md(x))
+                _pdf_write(pdf, 6, "-  " + x, markdown=True)
             pdf.ln(1)
         elif t == "code":
             pdf.set_font("Courier", "", 8)
@@ -234,9 +396,8 @@ def _to_pdf(content: str, title: str):
             pdf.ln(1)
         elif t == "table" and b["rows"]:
             pdf.set_font("Helvetica", "", 9)
-            for r in b["rows"]:
-                _pdf_write(pdf, 5, " | ".join(_strip_md(c) for c in r))
-            pdf.ln(1)
+            _pdf_table(pdf, b["rows"])
+            pdf.ln(2)
     return bytes(pdf.output()), "application/pdf", f"{title}.pdf"
 
 
@@ -254,8 +415,12 @@ def _to_xlsx(content: str, title: str):
                 sheet.append([_strip_md(c) for c in r])
     else:
         for b in blocks:
-            if b["type"] in ("para", "heading"):
+            if b["type"] == "heading":
                 ws.append([_strip_md(b["text"])])
+            elif b["type"] == "para":
+                for ln in b["text"].split("\n"):
+                    if ln.strip():
+                        ws.append([_strip_md(ln)])
             elif b["type"] == "list":
                 for x in b["items"]:
                     ws.append([_strip_md(x)])
@@ -290,7 +455,8 @@ def _to_pptx(content: str, title: str):
             flush()
             state["title"] = _strip_md(b["text"])
         elif b["type"] == "para":
-            state["bullets"].append(_strip_md(b["text"]))
+            state["bullets"].extend(
+                _strip_md(ln) for ln in b["text"].split("\n") if ln.strip())
         elif b["type"] == "list":
             state["bullets"].extend(_strip_md(x) for x in b["items"])
     flush()
@@ -330,9 +496,16 @@ _GENERATORS = {
 SUPPORTED_FORMATS = ["markdown", "word", "pdf", "excel", "csv", "text", "powerpoint", "zip"]
 
 
-def export_document(content: str, fmt: str, title: str = "document"):
-    """Return (bytes, mime_type, filename) for the requested format."""
+def export_document(content: str, fmt: str, title: str = "document",
+                    clean: bool = True):
+    """Return (bytes, mime_type, filename) for the requested format.
+
+    clean=True (the in-response download) strips the chat wrapper so the file
+    holds only the requested document. clean=False (the Export menu) keeps the
+    whole AI response verbatim.
+    """
     gen = _GENERATORS.get((fmt or "md").lower().strip())
     if gen is None:
         raise ValueError(f"Unsupported export format: {fmt}")
-    return gen(content or "", _safe_title(title))
+    body = _clean_for_export(content or "") if clean else (content or "")
+    return gen(body, _safe_title(_clean_title(title)))

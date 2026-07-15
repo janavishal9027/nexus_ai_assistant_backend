@@ -503,6 +503,25 @@ RESPONSE_FOLLOWUP_GUIDE = (
     "trivial replies."
 )
 
+# Downloads: the app turns any answer into a real .docx/.pdf/.xlsx/… via the
+# "Export" button under each message. The model must therefore produce the actual
+# content — never fabricate binary/base64 files, which was producing broken junk.
+DOCUMENT_EXPORT_GUIDE = (
+    "\n\nYou cannot attach files, host downloads, or emit binary data. NEVER "
+    "output base64 blobs, fake download links, or claim a file is attached, and "
+    "do NOT give the user scripts/steps to build the file themselves — that all "
+    "produces broken, unusable results. When the user asks for a downloadable "
+    "document (Word/.docx, PDF, Excel/.xlsx, PowerPoint, CSV, etc.), write the "
+    "COMPLETE, final content directly as clean, well-structured markdown (use "
+    "#/## headings, **bold**, bullet lists, and tables where useful). Output ONLY "
+    "the document itself: start with the document's own first line (e.g. the "
+    "person's name on a resume) — no preamble like 'Here is your resume', no "
+    "title that names the file format (e.g. no 'Resume (Markdown)'), and no note "
+    "about downloading or Export buttons. The app automatically converts your "
+    "answer into the real file and shows download buttons, so the content must "
+    "read as the finished document, not a chat reply about it."
+)
+
 
 def _build_agent_messages(
     db: Session,
@@ -527,6 +546,7 @@ def _build_agent_messages(
     # next-step questions in the response itself (chat-module A.2 · suggester,
     # surfaced in-line rather than as separate chips).
     system_prompt += RESPONSE_FOLLOWUP_GUIDE
+    system_prompt += DOCUMENT_EXPORT_GUIDE
 
     # Project standing instructions (A.7) — applied at the project-instructions
     # precedence: above learned memory / intent defaults, but below safety and
@@ -536,16 +556,38 @@ def _build_agent_messages(
         conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
         if conv is not None and getattr(conv, "project_id", None) is not None:
             proj = db.query(Project).filter(Project.id == conv.project_id).first()
-            if proj is not None and (proj.instructions or "").strip():
-                system_prompt += (
-                    "\n\n=== PROJECT INSTRUCTIONS ===\n"
-                    "Standing instructions for every chat in this project. Follow them "
-                    "unless they conflict with a safety rule or an explicit instruction "
-                    "in the user's latest message.\n\n"
-                    f"{proj.instructions.strip()}"
-                )
+            if proj is not None:
+                owner = getattr(proj, "owner_id", None)
+                if (proj.instructions or "").strip():
+                    system_prompt += (
+                        "\n\n=== PROJECT INSTRUCTIONS ===\n"
+                        "Standing instructions for every chat in this project. Follow them "
+                        "unless they conflict with a safety rule or an explicit instruction "
+                        "in the user's latest message.\n\n"
+                        f"{proj.instructions.strip()}"
+                    )
+                # Project brain (Part D Phase 4): auto-learned facts/decisions.
+                try:
+                    from ..memory import project_brain
+                    brain = project_brain.render(owner, proj.id)
+                    if brain:
+                        system_prompt += (
+                            "\n\n=== PROJECT BRAIN ===\n"
+                            "Durable facts, decisions and conventions learned about this "
+                            "project (context, not overriding safety or the user's ask).\n\n"
+                            + brain)
+                except Exception:
+                    pass
+                # Related facts from the content knowledge graph.
+                try:
+                    from ..rag import knowledge_graph
+                    facts = knowledge_graph.render(owner, user_message, project_id=proj.id)
+                    if facts:
+                        system_prompt += "\n\n=== RELATED FACTS ===\n" + facts
+                except Exception:
+                    pass
     except Exception as exc:
-        logger.warning(f"[Agent] project instructions skipped: {exc}")
+        logger.warning(f"[Agent] project context skipped: {exc}")
 
     # Deep Research mode: instruct the (large) model to produce a thorough,
     # structured, well-sourced answer rather than a quick reply.
@@ -940,7 +982,7 @@ async def agent_stream_chat(db: Session, request: ChatRequest, on_tool_event=Non
     try:
         from .rag_retrieval import retrieve_conversation_context
         doc_ctx, doc_srcs = await retrieve_conversation_context(
-            db, conversation_id, request.message, owner_id)
+            db, conversation_id, request.message, owner_id, history=request.history)
         if doc_ctx:
             doc_context = doc_ctx
             logger.info(f"[Agent/Stream] Conversation-RAG injected {len(doc_srcs)} source(s)")
@@ -1096,6 +1138,15 @@ async def agent_stream_chat(db: Session, request: ChatRequest, on_tool_event=Non
     except asyncio.CancelledError:
         logger.warning(f"[Agent/Stream] Streaming response generation cancelled (client disconnect)")
         raise  # Re-raise to propagate cancellation
+    except Exception as e:
+        # Conversation + user turn are already persisted; tag the error with the
+        # conversation id so the client binds to THIS conversation (a Retry
+        # reuses it instead of spawning a duplicate chat).
+        try:
+            e.conversation_id = conversation_id
+        except Exception:
+            pass
+        raise
 
     # Format citations for the route handler to append after stream
     citations_text = ""
@@ -1190,7 +1241,8 @@ async def agent_chat_orchestrated(db: Session, request, correlation_id: str, own
     # Turn-start memory search → prepend ## Relevant Memory (req 8.8)
     history = list(request.history or [])
     if request.conversation_id is not None:
-        mem_block = await memory_manager.auto_search(request.conversation_id, request.message)
+        mem_block = await memory_manager.auto_search(request.conversation_id, request.message,
+                                                     owner_id=owner_id)
         if mem_block:
             history = [MessageDto(role="system", content=mem_block)] + history
 
@@ -1227,6 +1279,7 @@ async def agent_chat_orchestrated(db: Session, request, correlation_id: str, own
     # Turn-end memory store (req 8.7)
     if conv_id is not None:
         await memory_manager.auto_store(conv_id, request.message, result.get("content", ""),
+                                        owner_id=owner_id,
                                         user_id=request_context.get_acting_user_id())
 
     await _write_session(session_id, conv_id)

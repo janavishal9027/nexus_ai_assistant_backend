@@ -18,6 +18,7 @@ import hashlib
 import logging
 import math
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from typing import Optional
 
 import httpx
@@ -34,6 +35,31 @@ _HTTP_TIMEOUT = 60.0
 _BATCH = 64                 # texts per request (keeps payloads well-bounded)
 _HASH_DIM = 768
 
+# In-process embedding cache: key = sha256(model|input_type|text) → vector.
+# Identical content (re-ingest, repeated query) reuses the vector instead of
+# re-calling the provider. Bounded LRU; cleared on restart (see
+# docs/semantic-embedding/04-embedding-service.md).
+_EMBED_CACHE: "OrderedDict[str, list[float]]" = OrderedDict()
+
+
+def _cache_get(key: str) -> Optional[list[float]]:
+    vec = _EMBED_CACHE.get(key)
+    if vec is not None:
+        _EMBED_CACHE.move_to_end(key)
+    return vec
+
+
+def _cache_put(key: str, vec: list[float], cap: int) -> None:
+    _EMBED_CACHE[key] = vec
+    _EMBED_CACHE.move_to_end(key)
+    while len(_EMBED_CACHE) > max(0, cap):
+        _EMBED_CACHE.popitem(last=False)
+
+
+def _l2_normalize(vec: list[float]) -> list[float]:
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
 
 class EmbeddingProvider(ABC):
     """Turns text into vectors. ``platform``/``model`` identify what produced a
@@ -41,6 +67,7 @@ class EmbeddingProvider(ABC):
 
     platform: str = "unknown"
     model: str = "unknown"
+    version: str = ""          # optional model-revision tag (provenance)
 
     def __init__(self) -> None:
         self._dim: Optional[int] = None
@@ -58,13 +85,60 @@ class EmbeddingProvider(ABC):
     async def _embed_batch(self, texts: list[str], input_type: Optional[str]) -> list[list[float]]:
         ...
 
+    def _cache_key(self, text: str, input_type: Optional[str]) -> str:
+        raw = f"{self.platform}/{self.model}@{self.version}|{input_type or ''}|{text}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    async def _embed_with_retry(self, texts: list[str], input_type: Optional[str]) -> list[list[float]]:
+        """One batch with exponential backoff on transient provider errors."""
+        from ..config import get_settings
+        retries = max(1, get_settings().rag_embed_max_retries)
+        delay = 0.5
+        last: Optional[Exception] = None
+        for attempt in range(retries):
+            try:
+                return await self._embed_batch(texts, input_type)
+            except Exception as exc:  # network / 429 / 5xx
+                last = exc
+                if attempt + 1 >= retries:
+                    break
+                logger.warning(f"[Embed] {self.platform}/{self.model} attempt "
+                               f"{attempt + 1}/{retries} failed ({exc}); retrying")
+                await asyncio.sleep(delay)
+                delay *= 2
+        raise last if last else RuntimeError("embedding failed")
+
     async def embed(self, texts: list[str], input_type: Optional[str] = None) -> list[list[float]]:
-        """Embed a list of texts, batching large inputs. Order is preserved."""
+        """Embed a list of texts. Batches large inputs, retries transient
+        failures with backoff, serves repeats from an in-process cache, and
+        optionally L2-normalizes. Order is preserved."""
         if not texts:
             return []
-        out: list[list[float]] = []
-        for i in range(0, len(texts), _BATCH):
-            out.extend(await self._embed_batch(texts[i:i + _BATCH], input_type))
+        from ..config import get_settings
+        s = get_settings()
+        normalize = bool(getattr(s, "rag_embed_normalize", False))
+        cap = int(getattr(s, "rag_embed_cache_size", 4096))
+
+        keys = [self._cache_key(t, input_type) for t in texts]
+        results: list[Optional[list[float]]] = [
+            (_cache_get(k) if cap > 0 else None) for k in keys
+        ]
+        missing = [i for i, r in enumerate(results) if r is None]
+
+        if missing:
+            fresh: list[list[float]] = []
+            miss_texts = [texts[i] for i in missing]
+            for i in range(0, len(miss_texts), _BATCH):
+                fresh.extend(await self._embed_with_retry(miss_texts[i:i + _BATCH], input_type))
+            if len(fresh) != len(missing):
+                raise RuntimeError("embedding count mismatch")
+            for j, i in enumerate(missing):
+                vec = _l2_normalize(fresh[j]) if normalize else fresh[j]
+                results[i] = vec
+                if cap > 0:
+                    _cache_put(keys[i], vec, cap)
+
+        out = [r for r in results if r is not None]
         if out and self._dim is None:
             self._dim = len(out[0])
         return out

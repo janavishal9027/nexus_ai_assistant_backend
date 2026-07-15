@@ -22,7 +22,7 @@ from ..models.db_models import Conversation, Message, ChatModel, ApiKey
 from .fallback_router import route_stream_chat, _is_chatty
 from .rag_chunking import extract_text, clean_text
 from .rag_ingestion import ingest_conversation_document
-from .agent import RESPONSE_FOLLOWUP_GUIDE
+from .agent import RESPONSE_FOLLOWUP_GUIDE, DOCUMENT_EXPORT_GUIDE
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +153,8 @@ async def multimodal_stream_chat(db: Session, request: ChatRequest, owner_id: Op
 
     messages: list[MessageDto] = [
         MessageDto(role="system",
-                   content="You are a helpful assistant." + RESPONSE_FOLLOWUP_GUIDE),
+                   content="You are a helpful assistant." + RESPONSE_FOLLOWUP_GUIDE
+                   + DOCUMENT_EXPORT_GUIDE),
     ]
     for m in (request.history or []):
         if m.role in ("user", "assistant"):
@@ -169,16 +170,23 @@ async def multimodal_stream_chat(db: Session, request: ChatRequest, owner_id: Op
             require_vision=bool(image_urls),
         )
     except Exception as e:
+        # The conversation + user turn are already persisted; tag the error with
+        # its id so the client binds to THIS conversation and a Retry reuses it
+        # instead of spawning a duplicate chat.
         if image_urls:
             # Reframe a routing failure for the image case: the user's only
             # vision models may be on an unavailable provider (e.g. Vercel needs
             # a card). Point them at a free vision provider.
-            raise ValueError(
+            e = ValueError(
                 "Couldn't reach a vision model to read your image. Your "
                 "vision-capable models may be unavailable right now (for example "
                 "Vercel AI Gateway requires a credit card). Add a provider that "
                 "offers a free vision model — such as OpenRouter or Groq (Llama "
                 f"Vision) — then try again.\n\n(technical detail: {e})"
-            ) from e
-        raise
+            )
+        try:
+            e.conversation_id = conversation_id
+        except Exception:
+            pass
+        raise e
     return conversation_id, result, ""

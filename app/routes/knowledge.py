@@ -158,16 +158,20 @@ async def upload_document(kb_id: int, background: BackgroundTasks,
     doc = Document(
         knowledge_base_id=kb.id, owner_id=account.id, filename=filename[:512],
         content_type=file.content_type, size_bytes=len(content),
-        status="pending", raw=content,
+        status="pending",
     )
+    # Store bytes via the object-store seam (DB BYTEA by default, or S3/MinIO).
+    from ..services.object_store import store_document_bytes
+    store_document_bytes(doc, content)
     db.add(doc)
     db.commit()
     db.refresh(doc)
 
     job = rag_ingestion.create_job(db, doc)
-    # Kick off ingestion after the response is sent. Owner id is passed
-    # explicitly (contextvars don't propagate into background tasks).
-    background.add_task(rag_ingestion.ingest_document, doc.id, account.id)
+    # Dispatch ingestion: publish a Kafka event when event-driven indexing is on
+    # and the broker is reachable, else run in-process via BackgroundTasks. Owner
+    # id is passed explicitly (contextvars don't propagate into background tasks).
+    await rag_ingestion.dispatch_ingestion(background, doc.id, account.id)
 
     return DocumentUploadResponse(document=_doc_dto(doc), job_id=job.id)
 
@@ -214,21 +218,21 @@ def get_document_job(kb_id: int, doc_id: int, db: Session = Depends(get_db),
 
 
 @router.post("/{kb_id}/documents/{doc_id}/reingest", response_model=DocumentUploadResponse)
-def reingest_document(kb_id: int, doc_id: int, background: BackgroundTasks,
-                      db: Session = Depends(get_db),
-                      account: Account = Depends(get_current_account)):
+async def reingest_document(kb_id: int, doc_id: int, background: BackgroundTasks,
+                            db: Session = Depends(get_db),
+                            account: Account = Depends(get_current_account)):
     _owned_kb(db, kb_id, account.id)
     doc = db.query(Document).filter(
         Document.id == doc_id, Document.knowledge_base_id == kb_id).first()
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
-    if not doc.raw:
+    if not (doc.raw or doc.storage_key):
         raise HTTPException(status_code=400, detail="Original file is no longer available")
     doc.status = "pending"
     doc.error = None
     db.commit()
     job = rag_ingestion.create_job(db, doc)
-    background.add_task(rag_ingestion.ingest_document, doc.id, account.id)
+    await rag_ingestion.dispatch_ingestion(background, doc.id, account.id)
     return DocumentUploadResponse(document=_doc_dto(doc), job_id=job.id)
 
 
@@ -240,6 +244,8 @@ def delete_document(kb_id: int, doc_id: int, db: Session = Depends(get_db),
         Document.id == doc_id, Document.knowledge_base_id == kb_id).first()
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
+    from ..services.object_store import delete_document_bytes
+    delete_document_bytes(doc)   # remove the S3 object (no-op in db mode)
     db.delete(doc)  # chunks + jobs cascade via FK ON DELETE CASCADE
     db.commit()
     return {"success": True}
@@ -287,7 +293,7 @@ async def kb_chat_stream(kb_id: int, body: KbChatRequest, db: Session = Depends(
 
     # Retrieve grounding context up front (so failures surface before streaming).
     try:
-        sources = await retrieve(db, kb, query, account.id)
+        sources = await retrieve(db, kb, query, account.id, history=body.history)
     except Exception as e:
         logger.error(f"[KB/Chat] Retrieval failed: {e}", exc_info=True)
         return JSONResponse(status_code=503, content={"error": f"Retrieval failed: {e}"})

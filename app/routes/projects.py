@@ -95,7 +95,48 @@ def delete_project(project_id: int,
         db.query(Conversation).filter(Conversation.project_id == project_id).update(
             {Conversation.project_id: None}, synchronize_session=False)
 
+    # Part D Phase 4: drop the project's brain + knowledge-graph rows.
+    try:
+        from ..models.db_models import ProjectBrainEntry, KgEdge
+        db.query(ProjectBrainEntry).filter(
+            ProjectBrainEntry.project_id == project_id).delete(synchronize_session=False)
+        db.query(KgEdge).filter(KgEdge.project_id == project_id).delete(synchronize_session=False)
+    except Exception:
+        db.rollback()
+
     db.query(Project).filter(Project.id == project_id).delete()
     db.commit()
     return {"success": True, "deleted_conversations": delete_conversations,
             "affected": convo_ids}
+
+
+@router.get("/{project_id}/brain")
+def project_brain_view(project_id: int, db: Session = Depends(get_db),
+                       account: Account = Depends(get_current_account)):
+    """The project's auto-learned brain (facts / decisions / conventions / goals)."""
+    _owned(db, project_id, account.id)
+    from ..memory import project_brain
+    return {"entries": project_brain.get_brain(account.id, project_id)}
+
+
+@router.delete("/{project_id}/brain/{entry_id}")
+def project_brain_delete(project_id: int, entry_id: int, db: Session = Depends(get_db),
+                         account: Account = Depends(get_current_account)):
+    """Prune a single brain entry."""
+    _owned(db, project_id, account.id)
+    from ..models.db_models import ProjectBrainEntry
+    n = db.query(ProjectBrainEntry).filter(
+        ProjectBrainEntry.id == entry_id,
+        ProjectBrainEntry.project_id == project_id,
+        ProjectBrainEntry.owner_id == account.id).delete(synchronize_session=False)
+    db.commit()
+    return {"deleted": bool(n)}
+
+
+@router.get("/{project_id}/graph")
+def project_graph(project_id: int, db: Session = Depends(get_db),
+                  account: Account = Depends(get_current_account)):
+    """The project's content knowledge graph (nodes + edges)."""
+    _owned(db, project_id, account.id)
+    from ..rag import knowledge_graph
+    return knowledge_graph.graph(account.id, project_id=project_id)

@@ -1,0 +1,63 @@
+# Phase 4 scale-out infra for Nexus AI RAG (opt-in). Nothing here is needed for
+# the default single-Postgres stack — it only backs the event-driven indexing
+# (Kafka), object storage (MinIO/S3), and tracing (OTLP → Jaeger) backends.
+#
+#   docker compose -f docker-compose.phase4.yml up -d
+#
+# Then enable the backends in backend/.env, e.g.:
+#   RAG_KAFKA_INDEXING=true
+#   KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+#   RAG_OBJECT_STORE=s3
+#   RAG_S3_ENDPOINT=http://localhost:9000
+#   RAG_S3_ACCESS_KEY=minioadmin
+#   RAG_S3_SECRET_KEY=minioadmin
+#   RAG_OTEL_ENABLED=true
+#   RAG_OTEL_ENDPOINT=http://localhost:4317
+# and (for the standalone worker):  python -m app.workers.rag_index_worker
+services:
+  # Redpanda — a single-binary, Kafka-API-compatible broker (no ZooKeeper).
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda start
+      - --smp 1
+      - --overprovisioned
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://localhost:9092
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # MinIO — S3-compatible object storage for document bytes.
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"    # S3 API
+      - "9001:9001"    # web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Jaeger all-in-one — receives OTLP spans from RagTrace and renders them.
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "4317:4317"    # OTLP gRPC (RAG_OTEL_ENDPOINT)
+      - "16686:16686"  # Jaeger UI
+
+volumes:
+  minio-data:
