@@ -44,9 +44,13 @@ class Settings(BaseSettings):
     memory_reflect_every_turns: int = 6           # reflect once per N stored turns/conversation
     memory_skill_dedup_threshold: float = 0.88    # merge skills more similar than this
     # ── Part D Phase 3: lifecycle (retention / export / purge) ────────────────
-    # Episodic memories older than this are purged by the background sweep. 0 =
-    # keep forever. Semantic skills (distilled + durable) never expire.
-    memory_retention_days: int = 0
+    # Episodic memories older than this are purged by the background sweep.
+    # 0 = keep forever (the raw Q&A log then grows unbounded, so it's not the
+    # default). A year is long enough that recall of anything still relevant is
+    # unaffected, while old raw transcripts don't accumulate indefinitely —
+    # what's worth keeping has by then been distilled into semantic skills and
+    # the personal graph, which never expire on this sweep.
+    memory_retention_days: int = 365
     memory_retention_sweep_hours: int = 24
     # ── Part D Phase 4: project brain + content knowledge graph ───────────────
     memory_project_brain_enabled: bool = True     # per-project auto-brain + ledger
@@ -54,6 +58,19 @@ class Settings(BaseSettings):
     memory_brain_dedup_threshold: float = 0.9
     memory_kg_enabled: bool = True                # entity/relation extraction
     memory_kg_every_turns: int = 4
+    memory_kg_decay_days: int = 180               # stale, un-reinforced facts fade; 0 = off
+    # ── Part D Phase 5: personal memory graph (per-user entity graph) ──────────
+    memory_graph_enabled: bool = True             # people/orgs + tools/tech about the user
+    memory_graph_every_turns: int = 3
+    memory_graph_decay_days: int = 90             # stale, un-reinforced edges fade; 0 = off
+    # Cosine floor for an edge to be recalled into the prompt (both graphs).
+    # MODEL-DEPENDENT — embedding models differ wildly in their similarity floor.
+    # Measured with mistral-embed (the default provider here): a related query
+    # scores ~0.70 against an edge, an unrelated one ~0.59 — hence 0.65. With
+    # OpenAI text-embedding-3-* the whole range is much lower and this wants to
+    # be ~0.35. Too strict is safe (recall falls back to keyword); too loose
+    # injects unrelated facts into every prompt. 0 = rank only, no filtering.
+    memory_graph_recall_threshold: float = 0.65
     # Bounded per-topic ring-buffer size for the Real-Time Events tool. Req 18.4
     realtime_event_buffer_size: int = 500
     # Comma-separated agent feature flags: planner,redis_cache,kafka,fcm,websocket. Req 15.7

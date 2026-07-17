@@ -59,7 +59,16 @@ class ApiKey(Base):
     api_key = Column(String, nullable=False)
     label = Column(String, default="")
     enabled = Column(Boolean, default=True)
-    status = Column(String, default="unknown")  # healthy, error, unknown
+    # Live health, written by the router on every attempt (see provider_health).
+    #   healthy  — the last call through this key succeeded
+    #   error    — key/credit problem (401/402/403). The router skips the whole
+    #              provider until the cooldown lapses, then re-tries it once.
+    #   limited  — rate-limited / quota (429). Transient, so still attempted.
+    #   unknown  — never used yet
+    status = Column(String, default="unknown")
+    # Why it's unhealthy, verbatim from the provider, so the UI can say
+    # "out of credits" instead of a generic red dot. Never contains the key.
+    last_error = Column(Text, nullable=True)
     # Owning account. NULL = shared/global key usable by everyone (e.g. the
     # seeded free-tier keys); a set value = a user's private key. Added to
     # existing databases via ALTER TABLE at startup.
@@ -128,6 +137,9 @@ class Message(Base):
     content = Column(Text, nullable=False)
     model_used = Column(String, nullable=True)
     platform_used = Column(String, nullable=True)
+    # True when the user stopped this assistant turn mid-stream (partial answer).
+    # A stopped answer is NOT offered as a downloadable document.
+    stopped = Column(Boolean, default=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     conversation = relationship("Conversation", back_populates="messages")
@@ -269,7 +281,94 @@ class KgEdge(Base):
     target = Column(String(200), nullable=False, index=True)
     source_type = Column(String(40), nullable=True)
     target_type = Column(String(40), nullable=True)
+    # Reinforced on repeat, like MemoryEdge: a fact restated across turns
+    # outranks a one-off (which may be an extraction error). Also the signal
+    # decay needs — without updated_at there's no notion of "stale".
+    support_count = Column(Integer, default=1)
+    # Embedding of "source relation target", so recall can match on meaning
+    # rather than shared substrings. Nullable: an edge is still usable (via the
+    # keyword fallback) when no embedding provider is configured.
+    embedding = _embedding_column(EMBEDDING_DIM)
+    embedding_dim = Column(Integer, nullable=True)   # mixed-dimension guard
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
+
+
+class MemoryEdge(Base):
+    """Personal memory graph (Part D Phase 5): an owner-scoped subject–relation–
+    object triple about the USER's world — people/orgs they know, tools/tech they
+    use — distilled from episodic memory across ALL conversations. Reinforced
+    (support_count↑ on repeats) and query-recalled into the prompt; unlike the
+    content KgEdge it is per-user and cross-conversation (no project/conv scope)."""
+    __tablename__ = "memory_edges"
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, nullable=True, index=True)
+    source = Column(String(200), nullable=False, index=True)
+    relation = Column(String(120), nullable=False)
+    target = Column(String(200), nullable=False, index=True)
+    source_type = Column(String(40), nullable=True)
+    target_type = Column(String(40), nullable=True)
+    support_count = Column(Integer, default=1)
+    # See KgEdge.embedding — same purpose, same fallback behavior.
+    embedding = _embedding_column(EMBEDDING_DIM)
+    embedding_dim = Column(Integer, nullable=True)   # mixed-dimension guard
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
+
+
+class MemoryPrefs(Base):
+    """Per-account memory opt-outs (the user's privacy levers, surfaced in
+    Settings → Memory). The config flags remain the operator-level kill switch;
+    these are the USER-level switch, and the effective setting is the AND of the
+    two — a user can always turn a layer off, never force one back on.
+
+    A missing row means "all defaults on", so nothing needs backfilling."""
+    __tablename__ = "memory_prefs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, nullable=False, unique=True, index=True)
+    # Recall: inject remembered context into the prompt at turn start.
+    recall_enabled = Column(Boolean, default=True, nullable=False)
+    # Record: persist turns to episodic memory at turn end.
+    record_enabled = Column(Boolean, default=True, nullable=False)
+    # Reflect: distil episodes + feedback into durable skills.
+    reflect_enabled = Column(Boolean, default=True, nullable=False)
+    # Graph: extract/recall the personal people-orgs + tools-tech graph.
+    graph_enabled = Column(Boolean, default=True, nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
+
+
+class AppearancePrefs(Base):
+    """Per-account look-and-feel, so a user's chat looks the same on every
+    device they sign in on (Settings → Personalization).
+
+    Everything here is cosmetic and the client keeps its own local copy, so this
+    table is a convenience — never a dependency. A missing row means "defaults",
+    and the columns are deliberately loose (plain strings/ints) because the
+    client owns the vocabulary; the server just stores what it's handed.
+
+    Note `wallpaper` holds a built-in id (or "custom"). A custom image lives on
+    the device that picked it and is NOT uploaded, so another device syncing
+    "custom" falls back to no wallpaper rather than showing someone a file they
+    don't have.
+    """
+    __tablename__ = "appearance_prefs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, nullable=False, unique=True, index=True)
+    theme_mode = Column(String(16), default="dark")        # system | light | dark
+    accent = Column(String(16), default="#10A37F")         # hex, incl. '#'
+    text_size = Column(Integer, default=15)                # message body px
+    corner_radius = Column(Integer, default=16)            # bubble radius px
+    density = Column(String(16), default="comfortable")    # comfortable | compact
+    reduce_animations = Column(Boolean, default=False)
+    wallpaper = Column(String(32), default="none")         # built-in id | none | custom
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
 
 
 class FCMToken(Base):

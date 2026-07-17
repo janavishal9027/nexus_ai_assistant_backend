@@ -42,7 +42,11 @@ def get_all(db: Session = Depends(get_db), account: Account = Depends(get_curren
             "label": k.label or "",
             "maskedKey": _mask_key(k.api_key),
             "enabled": k.enabled,
-            "status": k.status,
+            # Real health now that the router writes it (see provider_health):
+            # healthy | error | limited | unknown, plus why and when.
+            "status": k.status or "unknown",
+            "lastError": k.last_error,
+            "lastCheckedAt": k.last_checked_at.isoformat() if k.last_checked_at else None,
             "createdAt": k.created_at.isoformat() if k.created_at else "",
         }
         for k in keys
@@ -143,6 +147,63 @@ def toggle_key(key_id: int, body: ToggleKey, db: Session = Depends(get_db),
         key.enabled = body.enabled
         db.commit()
     return {"success": True, "enabled": key.enabled}
+
+
+@router.post("/{key_id}/test")
+async def test_key(key_id: int, db: Session = Depends(get_db),
+                   account: Account = Depends(get_current_account)):
+    """Check a key against its provider right now and record the result.
+
+    Without this the only way to learn a key is dead is to send a chat and watch
+    it silently fall back — and the only way to clear an `error` is to wait out
+    the cooldown.
+
+    max_tokens is deliberately generous: reasoning models (gpt-oss-120b on
+    cerebras/groq, magistral on mistral) spend their budget thinking and return
+    EMPTY content on a tight cap, which reads as a failure and would report a
+    perfectly good key as broken.
+    """
+    from ..models.db_models import ChatModel
+    from ..services import provider_health
+    from ..services.fallback_router import _is_chatty
+    from ..models.schemas import MessageDto
+
+    key = db.query(ApiKey).filter(ApiKey.id == key_id,
+                                  ApiKey.owner_id == account.id).first()
+    if not key:
+        raise HTTPException(status_code=404, detail="Key not found")
+
+    provider = provider_registry.get(key.platform)
+    if provider is None:
+        # Non-LLM keys (e.g. Tavily) have no chat endpoint to probe.
+        raise HTTPException(status_code=400,
+                            detail=f"'{key.platform}' keys can't be tested here")
+
+    model = next((m for m in db.query(ChatModel)
+                  .filter(ChatModel.platform == key.platform,
+                          ChatModel.enabled == True)
+                  .order_by(ChatModel.priority.asc()).all() if _is_chatty(m)), None)
+    if model is None:
+        raise HTTPException(status_code=400,
+                            detail=f"No chat model available for {key.platform}")
+
+    try:
+        await provider.chat_completion(
+            api_key=key.api_key,
+            messages=[MessageDto(role="user", content="Say hello")],
+            model_id=model.model_id, temperature=0.0, max_tokens=200)
+    except Exception as e:
+        status = provider_health.record_failure(db, key.id, e)
+        if status is None:
+            # The failure says nothing about the key (bad model id, provider 5xx).
+            return {"ok": False, "status": key.status or "unknown",
+                    "error": f"Could not verify the key: {e}"[:300]}
+        db.refresh(key)
+        return {"ok": False, "status": key.status, "error": key.last_error}
+
+    provider_health.record_success(db, key.id)
+    db.refresh(key)
+    return {"ok": True, "status": key.status, "error": None}
 
 
 @router.get("/platforms")

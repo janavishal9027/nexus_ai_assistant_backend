@@ -6,7 +6,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models.db_models import Account, Conversation, Message, MemoryChunk, ApiKey
+from ..models.db_models import (
+    Account, ApiKey, AppearancePrefs, Conversation, KgEdge, MemoryChunk,
+    MemoryEdge, MemoryPrefs, Message, MessageFeedback, Project,
+    ProjectBrainEntry, Skill,
+)
+from ..models.rag_models import (Document, DocumentChunk, IngestionJob,
+                                 KnowledgeBase)
 from ..models.schemas import (
     SignupRequest, LoginRequest, AuthResponse, AccountDto, ChangePasswordRequest,
     UpdateProfileRequest,
@@ -99,19 +105,66 @@ def change_password(body: ChangePasswordRequest, db: Session = Depends(get_db),
     return {"success": True}
 
 
+# Every owner-scoped table, as (model, label). Account deletion must clear ALL
+# of them: account ids are sequential, so anything left behind would be
+# inherited by the next account to take this id. Add new owner-scoped tables
+# here — leaving one out silently leaks a deleted user's data into a new one.
+# tests/integration/test_account_deletion.py asserts this list covers every
+# model with an owner_id, so a new table can't quietly go missing.
+# Ordered children-before-parents (documents FK to knowledge_bases, chunks and
+# jobs to documents) so a delete can't trip a foreign key.
+_OWNER_SCOPED = [
+    (MemoryChunk, "episodic"),          # raw Q&A log (+ embeddings)
+    (Skill, "skills"),                  # distilled preferences/lessons
+    (MessageFeedback, "feedback"),      # 👍/👎 ratings
+    (MemoryEdge, "memory_graph"),       # personal people/orgs + tools/tech graph
+    (KgEdge, "knowledge_graph"),        # content entity/relation facts
+    (ProjectBrainEntry, "project_brain"),
+    (Project, "projects"),
+    (MemoryPrefs, "memory_prefs"),
+    (AppearancePrefs, "appearance_prefs"),
+    (ApiKey, "api_keys"),
+    # RAG: the user's uploaded documents and everything derived from them.
+    (DocumentChunk, "document_chunks"),  # text + embeddings of uploads
+    (IngestionJob, "ingestion_jobs"),
+    (Document, "documents"),
+    (KnowledgeBase, "knowledge_bases"),
+]
+
+
 @router.delete("/me")
 def delete_account(db: Session = Depends(get_db),
                    account: Account = Depends(auth_service.get_current_account)):
-    """Permanently delete the account and all of its data (conversations, their
-    messages + memory chunks, and the account's private provider keys)."""
+    """Permanently delete the account and every row it owns — conversations and
+    their messages, all memory layers (episodic, skills, feedback, personal
+    graph, content knowledge graph, project brains), projects, memory
+    preferences, and private provider keys.
+
+    Deletes are owner-scoped and run in ONE transaction, so this either erases
+    everything or nothing.
+    """
     acc_id = account.id
-    conv_ids = [cid for (cid,) in db.query(Conversation.id).filter(Conversation.owner_id == acc_id).all()]
+    removed: dict[str, int] = {}
+
+    # Conversations + their messages. Messages have no owner_id, so they're
+    # reached through the conversation ids.
+    conv_ids = [cid for (cid,) in
+                db.query(Conversation.id).filter(Conversation.owner_id == acc_id).all()]
     if conv_ids:
-        db.query(MemoryChunk).filter(MemoryChunk.conversation_id.in_(conv_ids)).delete(synchronize_session=False)
-        db.query(Message).filter(Message.conversation_id.in_(conv_ids)).delete(synchronize_session=False)
-        db.query(Conversation).filter(Conversation.id.in_(conv_ids)).delete(synchronize_session=False)
-    db.query(ApiKey).filter(ApiKey.owner_id == acc_id).delete(synchronize_session=False)
+        removed["messages"] = db.query(Message).filter(
+            Message.conversation_id.in_(conv_ids)).delete(synchronize_session=False)
+        removed["conversations"] = db.query(Conversation).filter(
+            Conversation.id.in_(conv_ids)).delete(synchronize_session=False)
+
+    # Everything else is owner-scoped. NB: memory chunks are deleted by
+    # owner_id, not conversation_id — a chunk whose conversation was already
+    # deleted would otherwise survive its owner.
+    for model, label in _OWNER_SCOPED:
+        removed[label] = db.query(model).filter(
+            model.owner_id == acc_id).delete(synchronize_session=False)
+
     db.delete(account)
     db.commit()
-    logger.info(f"[Auth] Account deleted id={acc_id} ({len(conv_ids)} conversations removed)")
+    logger.info(f"[Auth] Account deleted id={acc_id} removed="
+                f"{ {k: v for k, v in removed.items() if v} }")
     return {"success": True}

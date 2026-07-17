@@ -76,6 +76,7 @@ def get_by_id(conversation_id: int, db: Session = Depends(get_db),
                 model=(name_by_id.get(m.model_used, m.model_used)
                        if m.model_used else None),
                 platform=m.platform_used,
+                stopped=bool(getattr(m, "stopped", False)),
             )
             for m in messages
         ],
@@ -104,6 +105,19 @@ def delete(conversation_id: int, db: Session = Depends(get_db),
         from ..models.db_models import MemoryChunk
         db.query(MemoryChunk).filter(
             MemoryChunk.conversation_id.in_(to_delete)
+        ).delete(synchronize_session=False)
+    except Exception:
+        db.rollback()
+    # Content knowledge-graph edges extracted from these conversations. KgEdge
+    # has no FK/cascade to conversations, so without this the rows outlive the
+    # chat they came from — invisible, undeletable, and still recalled into
+    # prompts. Project-scoped edges are left alone: they're project knowledge
+    # that outlives any single chat, and go when the project does.
+    try:
+        from ..models.db_models import KgEdge
+        db.query(KgEdge).filter(
+            KgEdge.conversation_id.in_(to_delete),
+            KgEdge.project_id.is_(None),
         ).delete(synchronize_session=False)
     except Exception:
         db.rollback()

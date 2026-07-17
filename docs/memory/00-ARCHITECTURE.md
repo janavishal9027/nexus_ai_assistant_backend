@@ -3,7 +3,8 @@
 > Layered memory that makes the assistant remember *the user* across sessions —
 > and *the project* across its chats. Adapted to Nexus AI's stack (FastAPI +
 > Postgres/pgvector), reusing the RAG embedding provider. Built in phases;
-> **Phases 1–4 are shipped** (the full layered stack + project brain + graph).
+> **Phases 1–5 are shipped** (the layered stack + project brain + content graph +
+> a personal memory graph).
 
 ```
    WORKING memory ── session end / idle ──▶ EPISODIC memory ── distil ──▶ SEMANTIC memory
@@ -25,6 +26,7 @@
 | **Lifecycle** | `app/memory/data_lifecycle.py` + `routes/memory.py` | — | ✅ Phase 3 |
 | **Project brain** | `app/memory/project_brain.py` + `ProjectBrainEntry` | Postgres + pgvector | ✅ Phase 4 |
 | **Knowledge graph** | `app/rag/knowledge_graph.py` + `KgEdge` | Postgres | ✅ Phase 4 |
+| **Personal memory graph** | `app/memory/memory_graph.py` + `MemoryEdge` | Postgres | ✅ Phase 5 |
 
 ---
 
@@ -145,3 +147,44 @@ auth (brain GET/DELETE, graph GET, cross-owner 404); 139 backend tests unaffecte
 
 **Config:** `memory_project_reflect_every_turns` (8), `memory_brain_dedup_threshold`
 (0.9), `memory_kg_every_turns` (4).
+
+## Phase 5 — personal memory graph (SHIPPED ✅)
+
+Where Phase 4's *content* knowledge graph (`rag/knowledge_graph.py`, `KgEdge`) is
+scoped to a project/conversation, the **personal memory graph** (`memory/
+memory_graph.py`, `MemoryEdge`) is owner-scoped and **cross-conversation** — "what
+I know about *you*", relationally. It captures only **people/orgs** you mention and
+**tools/tech** you work with, as subject–relation–object triples distilled from
+episodic memory across all chats.
+
+- **Extraction** — `extract()` asks the LLM for personal triples (subject usually
+  "User"); `_parse()` normalizes `source_type`/`target_type` and keeps only
+  `person | org | tool | tech | user` (topic/preference/goal triples are dropped so
+  the graph stays focused). `maybe_extract()` is debounced (once per
+  `memory_graph_every_turns` turns, default 3) and runs in the background.
+- **Reinforce + decay** — `_store()` dedups on lowercased (source, relation,
+  target); a repeat bumps `support_count` (strongest recalled first). A slow decay
+  (`memory_graph_decay_days`, default 90) fades edges not reinforced within the
+  window and drops the weakest — wired into the lifecycle sweeper alongside
+  episodic retention. (Decay deletes weak stale edges outright and preserves
+  `updated_at` when fading stronger ones, so a fact keeps decaying across sweeps
+  instead of a bulk-update's `onupdate` resetting its staleness.)
+- **Recall (query-relevant)** — `render()` injects only the graph facts whose
+  entities match the current message; `memory_manager.auto_search` adds them as a
+  **## What I know about you** block at turn start (low token cost).
+- **Graph API** — `GET /api/memory/graph` (nodes+edges), `…/graph/neighbors?entity=`
+  (edges touching an entity), `…/graph/query?q=` (keyword-matched); all owner-scoped
+  via JWT. Included in the memory `summary` / `export` / `purge?scope=graph|all`.
+- **Bug fix on the way through:** `knowledge_graph.maybe_extract` (async) was being
+  called from `auto_store` **without `await`**, so the content-KG trigger's coroutine
+  was created and discarded (never ran) — now awaited, so the content graph
+  actually populates from chats too.
+
+**Verified:** 20/20 module smoke checks (type-filtering, insert + reinforce →
+support_count, query/neighbors/graph/render, owner isolation, decay fades/deletes
+stale while fresh survives, summary/purge); live HTTP round-trip through auth
+(`/graph`, `/graph/neighbors`, `/graph/query`, counts). Backend-only (surfaces:
+prompt recall + Graph API) — no app rebuild.
+
+**Config:** `memory_graph_enabled` (on), `memory_graph_every_turns` (3),
+`memory_graph_decay_days` (90; 0 = keep forever).

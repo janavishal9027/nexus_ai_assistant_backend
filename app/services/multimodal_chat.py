@@ -151,10 +151,11 @@ async def multimodal_stream_chat(db: Session, request: ChatRequest, owner_id: Op
     elif image_urls and not request.message.strip():
         prompt = "Describe the attached image(s)."
 
+    from .agent import _user_directive
     messages: list[MessageDto] = [
         MessageDto(role="system",
                    content="You are a helpful assistant." + RESPONSE_FOLLOWUP_GUIDE
-                   + DOCUMENT_EXPORT_GUIDE),
+                   + DOCUMENT_EXPORT_GUIDE + _user_directive(db, owner_id)),
     ]
     for m in (request.history or []):
         if m.role in ("user", "assistant"):

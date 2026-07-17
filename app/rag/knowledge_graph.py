@@ -11,9 +11,10 @@ import asyncio
 import json
 import logging
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import or_, func
+from sqlalchemy import func
 
 from ..database import SessionLocal
 from ..models.db_models import KgEdge
@@ -58,23 +59,35 @@ def _parse(text: str) -> list[dict]:
 
 
 def _store(owner_id, project_id, conversation_id, triples: list[dict]) -> int:
+    """Insert new edges; reinforce (support_count↑) existing ones. Returns #added.
+
+    Repeats reinforce rather than being discarded: restating a fact is evidence
+    it's real, and support_count is what ranks recall and resists decay. Without
+    it a one-off extraction error would rank equal to a fact seen fifty times."""
     if not triples:
         return 0
     db = SessionLocal()
     try:
         added = 0
         for tr in triples:
-            exists = (db.query(KgEdge.id).filter(
+            row = (db.query(KgEdge).filter(
                 KgEdge.owner_id == owner_id,
                 (KgEdge.project_id == project_id) if project_id is not None
                 else (KgEdge.conversation_id == conversation_id),
                 func.lower(KgEdge.source) == tr["source"].lower(),
                 func.lower(KgEdge.relation) == tr["relation"].lower(),
                 func.lower(KgEdge.target) == tr["target"].lower()).first())
-            if exists:
+            if row:
+                row.support_count = (row.support_count or 1) + 1
+                row.updated_at = datetime.now(timezone.utc)
+                # Backfill the vector on edges stored before embeddings existed
+                # (or written while no provider was configured).
+                if row.embedding is None and tr.get("embedding"):
+                    row.embedding = tr["embedding"]
+                    row.embedding_dim = tr["embedding_dim"]
                 continue
             db.add(KgEdge(owner_id=owner_id, project_id=project_id,
-                          conversation_id=conversation_id, **tr))
+                          conversation_id=conversation_id, support_count=1, **tr))
             added += 1
         db.commit()
         return added
@@ -102,6 +115,9 @@ async def extract(owner_id: Optional[int], project_id: Optional[int],
     finally:
         db.close()
     triples = _parse(content)
+    # Embed before the (sync) write so recall can match on meaning.
+    from ..memory import graph_recall
+    triples = await graph_recall.embed_edges(owner_id, triples)
     added = await asyncio.to_thread(_store, owner_id, project_id, conversation_id, triples)
     if added:
         logger.info(f"[KG] added {added} edge(s) (project={project_id} conv={conversation_id})")
@@ -119,54 +135,111 @@ def _scoped(db, owner_id, project_id, conversation_id):
 
 def graph(owner_id: Optional[int], project_id: Optional[int] = None,
           conversation_id: Optional[int] = None, limit: int = 300) -> dict:
-    """Nodes + edges for a graph view."""
+    """Nodes + edges for a graph view (strongest first)."""
     if owner_id is None:
         return {"nodes": [], "edges": []}
     db = SessionLocal()
     try:
-        rows = _scoped(db, owner_id, project_id, conversation_id).limit(limit).all()
+        rows = (_scoped(db, owner_id, project_id, conversation_id)
+                .order_by(KgEdge.support_count.desc(), KgEdge.id.desc())
+                .limit(limit).all())
         nodes: dict[str, dict] = {}
         edges = []
         for e in rows:
             nodes.setdefault(e.source, {"id": e.source, "type": e.source_type})
             nodes.setdefault(e.target, {"id": e.target, "type": e.target_type})
-            edges.append({"source": e.source, "relation": e.relation, "target": e.target})
+            edges.append({"id": e.id, "source": e.source, "relation": e.relation,
+                          "target": e.target, "support": e.support_count})
         return {"nodes": list(nodes.values()), "edges": edges}
     finally:
         db.close()
 
 
-def query(owner_id: Optional[int], text: str, project_id: Optional[int] = None,
-          conversation_id: Optional[int] = None, limit: int = 12) -> list[dict]:
-    """Edges whose source or target matches a term from the query (keyword)."""
+def _scope_filters(owner_id, project_id, conversation_id) -> list:
+    """The same scoping as _scoped(), as a filter list for graph_recall."""
+    f = [KgEdge.owner_id == owner_id]
+    if project_id is not None:
+        f.append(KgEdge.project_id == project_id)
+    elif conversation_id is not None:
+        f.append(KgEdge.conversation_id == conversation_id)
+    return f
+
+
+async def query(owner_id: Optional[int], text: str, project_id: Optional[int] = None,
+                conversation_id: Optional[int] = None, limit: int = 12) -> list[dict]:
+    """Edges relevant to the query — semantic when embeddings are available,
+    keyword otherwise. See memory.graph_recall."""
     if owner_id is None or not str(text or "").strip():
         return []
-    terms = [t for t in re.findall(r"\w{3,}", text.lower())][:8]
-    if not terms:
-        return []
+    from ..memory import graph_recall
+    rows = await graph_recall.search(
+        KgEdge, owner_id, _scope_filters(owner_id, project_id, conversation_id),
+        text, limit=limit)
+    return [{"id": e.id, "source": e.source, "relation": e.relation,
+             "target": e.target, "support": e.support_count} for e in rows]
+
+
+async def render(owner_id: Optional[int], query_text: str, project_id: Optional[int] = None,
+                 conversation_id: Optional[int] = None, limit: int = 10) -> str:
+    """A '=== RELATED FACTS ===' block for the system prompt."""
+    edges = await query(owner_id, query_text, project_id=project_id,
+                        conversation_id=conversation_id, limit=limit)
+    if not edges:
+        return ""
+    return "\n".join(f"- {e['source']} {e['relation']} {e['target']}" for e in edges)
+
+
+# ── Lifecycle ────────────────────────────────────────────────────────────────
+
+def summary(owner_id: int) -> int:
     db = SessionLocal()
     try:
-        q = _scoped(db, owner_id, project_id, conversation_id)
-        conds = []
-        for t in terms:
-            like = f"%{t}%"
-            conds.append(func.lower(KgEdge.source).like(like))
-            conds.append(func.lower(KgEdge.target).like(like))
-        rows = q.filter(or_(*conds)).limit(limit).all()
-        return [{"source": e.source, "relation": e.relation, "target": e.target}
-                for e in rows]
+        return db.query(KgEdge).filter(KgEdge.owner_id == owner_id).count()
     finally:
         db.close()
 
 
-def render(owner_id: Optional[int], query_text: str, project_id: Optional[int] = None,
-           conversation_id: Optional[int] = None, limit: int = 10) -> str:
-    """A '=== RELATED FACTS ===' block for the system prompt."""
-    edges = query(owner_id, query_text, project_id=project_id,
-                  conversation_id=conversation_id, limit=limit)
-    if not edges:
-        return ""
-    return "\n".join(f"- {e['source']} {e['relation']} {e['target']}" for e in edges)
+def purge(owner_id: int) -> int:
+    db = SessionLocal()
+    try:
+        n = (db.query(KgEdge).filter(KgEdge.owner_id == owner_id)
+             .delete(synchronize_session=False))
+        db.commit()
+        return n
+    finally:
+        db.close()
+
+
+def decay(days: Optional[int] = None) -> int:
+    """Slow decay (global sweep), mirroring memory_graph.decay: edges not
+    reinforced within ``days`` fade a support point; the weakest are dropped.
+    0/None disables. Returns #removed.
+
+    As in the personal graph, ``updated_at`` must be held OLD when fading a
+    stronger edge, or the column's onupdate would reset staleness and the edge
+    would never finish decaying — hence setting updated_at to itself."""
+    from ..config import get_settings
+    days = days if days is not None else get_settings().memory_kg_decay_days
+    if not days or days <= 0:
+        return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    db = SessionLocal()
+    try:
+        removed = db.query(KgEdge).filter(
+            KgEdge.updated_at < cutoff,
+            KgEdge.support_count <= 1).delete(synchronize_session=False)
+        db.query(KgEdge).filter(
+            KgEdge.updated_at < cutoff,
+            KgEdge.support_count > 1).update(
+            {KgEdge.support_count: KgEdge.support_count - 1,
+             KgEdge.updated_at: KgEdge.updated_at},
+            synchronize_session=False)
+        db.commit()
+        if removed:
+            logger.info(f"[KG] decay dropped {removed} stale edge(s)")
+        return removed
+    finally:
+        db.close()
 
 
 async def maybe_extract(owner_id: Optional[int], conversation_id: Optional[int]) -> None:

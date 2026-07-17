@@ -512,8 +512,12 @@ DOCUMENT_EXPORT_GUIDE = (
     "do NOT give the user scripts/steps to build the file themselves — that all "
     "produces broken, unusable results. When the user asks for a downloadable "
     "document (Word/.docx, PDF, Excel/.xlsx, PowerPoint, CSV, etc.), write the "
-    "COMPLETE, final content directly as clean, well-structured markdown (use "
-    "#/## headings, **bold**, bullet lists, and tables where useful). Output ONLY "
+    "COMPLETE, final content directly as clean, well-structured markdown so it "
+    "renders as a polished document: a top '# Title' (optionally one short "
+    "subtitle line under it), '##' section headings, **bold** for emphasis, "
+    "bullet/numbered lists, markdown tables for any structured data, fenced code "
+    "blocks (```lang) for code, and blockquotes ('> **Note:** …') for tips, "
+    "warnings, or important callouts. Output ONLY "
     "the document itself: start with the document's own first line (e.g. the "
     "person's name on a resume) — no preamble like 'Here is your resume', no "
     "title that names the file format (e.g. no 'Resume (Markdown)'), and no note "
@@ -523,7 +527,39 @@ DOCUMENT_EXPORT_GUIDE = (
 )
 
 
-def _build_agent_messages(
+def _user_directive(db: Session, owner_id: int | None) -> str:
+    """A short instruction telling the model the signed-in user's name so it can
+    address them personally (e.g. "Hi Vishal!" instead of a generic "Hi there!").
+    The name is the one the user set in Settings. Returns "" if unknown."""
+    if owner_id is None:
+        return ""
+    try:
+        from ..models.db_models import Account
+        acct = db.query(Account).filter(Account.id == owner_id).first()
+        if acct is None:
+            return ""
+        raw = (getattr(acct, "name", None) or "").strip()
+        if not raw:
+            # Fall back to the local part of the email as a last resort.
+            email = (getattr(acct, "email", None) or "").strip()
+            raw = email.split("@", 1)[0] if "@" in email else email
+        raw = raw.strip()
+        if not raw:
+            return ""
+        first = raw.split()[0]
+        return (
+            "\n\n=== USER ===\n"
+            f"The person you're talking to is named {raw}. "
+            f"Address them by their first name, {first}, where it feels natural — "
+            f'especially in greetings (say "Hi {first}!" rather than a generic '
+            '"Hi there!"). Keep it warm but don\'t overuse the name or repeat it in '
+            "every sentence."
+        )
+    except Exception:
+        return ""
+
+
+async def _build_agent_messages(
     db: Session,
     conversation_id: int,
     user_message: str,
@@ -531,8 +567,11 @@ def _build_agent_messages(
     web_context: str | None = None,
     deep_research: bool = False,
     doc_context: str | None = None,
+    owner_id: int | None = None,
 ) -> list[MessageDto]:
-    """Build the message list with system prompt and context window trimming."""
+    """Build the message list with system prompt and context window trimming.
+
+    Async because knowledge-graph recall embeds the query (see graph_recall)."""
     config = get_config()
     agent_cfg = config.get("agent", {})
     system_prompt = agent_cfg.get("system_prompt", "You are a helpful assistant.")
@@ -541,6 +580,10 @@ def _build_agent_messages(
     # Always give the model the real current date (it can't know it otherwise).
     today = datetime.now().strftime("%A, %B %d, %Y")
     system_prompt = f"{system_prompt}\n\nToday's date is {today}."
+
+    # Personalize: let the model address the signed-in user by the name they set
+    # in Settings, instead of a generic greeting.
+    system_prompt += _user_directive(db, owner_id)
 
     # Inline follow-up suggestions: the responder ends useful answers with a few
     # next-step questions in the response itself (chat-module A.2 · suggester,
@@ -581,7 +624,8 @@ def _build_agent_messages(
                 # Related facts from the content knowledge graph.
                 try:
                     from ..rag import knowledge_graph
-                    facts = knowledge_graph.render(owner, user_message, project_id=proj.id)
+                    facts = await knowledge_graph.render(owner, user_message,
+                                                         project_id=proj.id)
                     if facts:
                         system_prompt += "\n\n=== RELATED FACTS ===\n" + facts
                 except Exception:
@@ -706,9 +750,9 @@ async def agent_chat(db: Session, request: ChatRequest, owner_id: int | None = N
         else:
             logger.warning(f"[Agent] Web search returned no results")
 
-    messages = _build_agent_messages(
+    messages = await _build_agent_messages(
         db, conversation_id, request.message, request.history, web_context,
-        deep_research=deep_research,
+        deep_research=deep_research, owner_id=owner_id,
     )
 
     # --- New tool orchestration loop ---
@@ -989,9 +1033,9 @@ async def agent_stream_chat(db: Session, request: ChatRequest, on_tool_event=Non
     except Exception as e:
         logger.warning(f"[Agent/Stream] conversation-RAG skipped: {e}")
 
-    messages = _build_agent_messages(
+    messages = await _build_agent_messages(
         db, conversation_id, request.message, request.history, web_context,
-        deep_research=deep_research, doc_context=doc_context,
+        deep_research=deep_research, doc_context=doc_context, owner_id=owner_id,
     )
 
     # --- Tool orchestration loop (runs in non-streaming mode before streaming begins) ---

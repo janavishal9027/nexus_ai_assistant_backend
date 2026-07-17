@@ -12,6 +12,7 @@ from ..models.db_models import ChatModel, ApiKey
 from ..models.schemas import MessageDto
 from ..providers.registry import provider_registry
 from . import rate_limit
+from . import provider_health
 from . import request_context
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,11 @@ _NON_CHAT_HINTS = (
     "compound",
     # Google (and others) non-text families that error out on chat completions.
     "imagen", "veo", "lyria", "music", "gemini-embedding", "text-embedding", "aqa",
+    # Mistral's Voxtral family is audio (ASR/TTS/realtime). Only the "-tts-"
+    # variants matched a hint above, so plain `voxtral-mini-2602` looked chatty
+    # and every auto route burned a round-trip on it for a 400 Invalid model —
+    # eating the fallback budget before reaching providers that work.
+    "voxtral", "asr", "transcribe", "diariz", "realtime",
 )
 
 
@@ -217,7 +223,8 @@ def _get_ordered_models(
     active_platforms = set(
         row[0] for row in
         _apply_owner_scope(
-            db.query(ApiKey.platform).filter(ApiKey.enabled == True, ApiKey.status != "error")
+            db.query(ApiKey.platform).filter(ApiKey.enabled == True,
+                                             provider_health.usable_filter())
         ).distinct().all()
     )
 
@@ -358,7 +365,7 @@ async def route_chat(
                     db.query(ApiKey).filter(
                         ApiKey.platform == model.platform,
                         ApiKey.enabled == True,
-                        ApiKey.status != "error",
+                        provider_health.usable_filter(),
                     )
                 )
                 .all()
@@ -391,6 +398,7 @@ async def route_chat(
                         raise RuntimeError(f"Empty response from {model.display_name}")
 
                     rate_limit.record_success(model.platform, model.model_id, key.id)
+                    provider_health.record_success(db, key.id)
                     logger.info(f"[Router] Success: {model.display_name} via {model.platform}")
 
                     return RouteResult(
@@ -408,15 +416,17 @@ async def route_chat(
                     )
                     skip_keys.add(skip_id)
                     msg = str(e).lower()
+                    # Persist what this says about the key, so the next request
+                    # skips a dead provider outright instead of re-discovering it
+                    # (and so Settings can explain why).
+                    health = provider_health.record_failure(db, key.id, e)
                     # Provider-level failure (bad, forbidden or uncredited key) →
                     # skip the WHOLE provider immediately, regardless of whether the
                     # error is "retryable" (e.g. Vercel's 403 "requires a valid
-                    # credit card" is not).
-                    if any(t in msg for t in (
-                        "401", "403", "unauthorized", "forbidden", "permission",
-                        "invalid api key", "authentication", "credit card",
-                        "customer_verification", "payment required", "billing",
-                    )):
+                    # credit card" is not, and OpenRouter's 402 "requires more
+                    # credits" once fell through to a per-model retry that walked
+                    # every model until the budget died).
+                    if health == provider_health.ERROR:
                         skip_platforms.add(model.platform)
                         skip_models.add(model.id)
                         break
@@ -497,7 +507,7 @@ async def route_stream_chat(
                     db.query(ApiKey).filter(
                         ApiKey.platform == model.platform,
                         ApiKey.enabled == True,
-                        ApiKey.status != "error",
+                        provider_health.usable_filter(),
                     )
                 )
                 .all()
@@ -559,6 +569,7 @@ async def route_stream_chat(
                             yield chunk
 
                     rate_limit.record_success(model.platform, model.model_id, key.id)
+                    provider_health.record_success(db, key.id)
 
                     return StreamRouteResult(
                         stream=_primed_stream(),
@@ -575,16 +586,13 @@ async def route_stream_chat(
                     )
                     skip_keys.add(skip_id)
                     msg = str(e).lower()
+                    health = provider_health.record_failure(db, key.id, e)
                     # Provider-level failure (bad, forbidden or uncredited key) →
                     # skip the WHOLE provider immediately so we don't waste a
                     # round-trip on every other model behind the same failing key.
                     # Checked regardless of whether the error is "retryable" (e.g.
                     # Vercel's 403 "requires a valid credit card" is not).
-                    if any(t in msg for t in (
-                        "401", "403", "unauthorized", "forbidden", "permission",
-                        "invalid api key", "authentication", "credit card",
-                        "customer_verification", "payment required", "billing",
-                    )):
+                    if health == provider_health.ERROR:
                         skip_platforms.add(model.platform)
                         skip_models.add(model.id)
                         break

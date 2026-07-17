@@ -8,12 +8,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from .database import engine, SessionLocal, Base
+from .models.db_models import HAS_PGVECTOR
 from .routes import chat, conversations, keys, models, config
 from .routes import agent as agent_routes
 from .routes import auth as auth_routes
 from .routes import knowledge as knowledge_routes
 from .routes import projects as projects_routes
 from .routes import memory as memory_routes
+from .routes import appearance as appearance_routes
 # Import RAG models so their tables are registered with Base.metadata before
 # create_all runs (knowledge_bases, documents, document_chunks, ingestion_jobs).
 from .models import rag_models  # noqa: F401
@@ -38,10 +40,34 @@ def _ensure_auth_schema() -> None:
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_conversations_owner_id ON conversations (owner_id)"))
             conn.execute(text("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS owner_id INTEGER"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_api_keys_owner_id ON api_keys (owner_id)"))
+            # Why a key is unhealthy ("out of credits", "key reported as
+            # leaked"), so Settings can explain a failure instead of showing a
+            # status that was never written at all.
+            conn.execute(text("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS last_error TEXT"))
             conn.execute(text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS parent_id INTEGER"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_conversations_parent_id ON conversations (parent_id)"))
             conn.execute(text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS project_id INTEGER"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_conversations_project_id ON conversations (project_id)"))
+            # messages.stopped: mark turns stopped mid-stream (partial); such
+            # answers are not offered as a downloadable document.
+            conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS stopped BOOLEAN DEFAULT FALSE"))
+            # kg_edges support_count/updated_at: the content graph gained
+            # reinforcement + decay, matching the personal graph. Existing rows
+            # backfill to support 1 / now, so they age from this boot rather
+            # than being swept immediately as infinitely stale.
+            conn.execute(text("ALTER TABLE kg_edges ADD COLUMN IF NOT EXISTS support_count INTEGER DEFAULT 1"))
+            conn.execute(text("ALTER TABLE kg_edges ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP"))
+            conn.execute(text("UPDATE kg_edges SET support_count = 1 WHERE support_count IS NULL"))
+            conn.execute(text("UPDATE kg_edges SET updated_at = COALESCE(created_at, NOW()) WHERE updated_at IS NULL"))
+            # Edge embeddings, so graph recall matches on meaning rather than
+            # shared substrings. Pre-existing edges keep a NULL vector and are
+            # still reachable via the keyword fallback.
+            _emb_type = "vector" if HAS_PGVECTOR else "json"
+            for _tbl in ("kg_edges", "memory_edges"):
+                conn.execute(text(
+                    f"ALTER TABLE {_tbl} ADD COLUMN IF NOT EXISTS embedding {_emb_type}"))
+                conn.execute(text(
+                    f"ALTER TABLE {_tbl} ADD COLUMN IF NOT EXISTS embedding_dim INTEGER"))
         logger.info("[Auth] Ensured conversations.owner_id and api_keys.owner_id columns exist")
     except Exception as exc:
         logger.warning(f"[Auth] Could not ensure owner_id column: {exc}")
@@ -240,26 +266,43 @@ _retention_task = None
 
 
 def _start_memory_lifecycle() -> None:
-    """Background episodic-memory retention sweep (Part D Phase 3). Gated on
-    ``memory_retention_days`` > 0 — default off (keep forever)."""
+    """Background sweeps (Part D): episodic retention (Phase 3), personal
+    memory-graph decay (Phase 5), and content knowledge-graph decay (Phase 4).
+    Each is independently config-gated; the sweeper starts if any is enabled."""
     s = get_settings()
     days = getattr(s, "memory_retention_days", 0)
-    if days <= 0:
+    decay_days = getattr(s, "memory_graph_decay_days", 0)
+    kg_decay_days = getattr(s, "memory_kg_decay_days", 0)
+    if days <= 0 and decay_days <= 0 and kg_decay_days <= 0:
         return
     hours = max(1, getattr(s, "memory_retention_sweep_hours", 24))
 
     async def _loop() -> None:
-        from .memory import data_lifecycle
+        from .memory import data_lifecycle, memory_graph
+        from .rag import knowledge_graph
         while True:
-            try:
-                await asyncio.to_thread(data_lifecycle.apply_retention, days)
-            except Exception as exc:
-                logger.warning(f"[Lifecycle] retention sweep failed: {exc}")
+            if days > 0:
+                try:
+                    await asyncio.to_thread(data_lifecycle.apply_retention, days)
+                except Exception as exc:
+                    logger.warning(f"[Lifecycle] retention sweep failed: {exc}")
+            if decay_days > 0:
+                try:
+                    await asyncio.to_thread(memory_graph.decay)
+                except Exception as exc:
+                    logger.warning(f"[Lifecycle] graph decay failed: {exc}")
+            if kg_decay_days > 0:
+                try:
+                    await asyncio.to_thread(knowledge_graph.decay)
+                except Exception as exc:
+                    logger.warning(f"[Lifecycle] kg decay failed: {exc}")
             await asyncio.sleep(hours * 3600)
 
     global _retention_task
     _retention_task = asyncio.get_event_loop().create_task(_loop())
-    logger.info(f"[Lifecycle] retention sweeper started ({days}d every {hours}h)")
+    logger.info(f"[Lifecycle] sweeper started (retention={days}d, "
+                f"graph-decay={decay_days}d, kg-decay={kg_decay_days}d, "
+                f"every {hours}h)")
 
 
 async def _stop_memory_lifecycle() -> None:
@@ -364,6 +407,7 @@ app.include_router(auth_routes.router)
 app.include_router(knowledge_routes.router)
 app.include_router(projects_routes.router)
 app.include_router(memory_routes.router)
+app.include_router(appearance_routes.router)
 
 
 @app.get("/api/ping")

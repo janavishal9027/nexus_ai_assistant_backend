@@ -20,6 +20,7 @@ _FENCE_RE = re.compile(r"^```(\w*)\s*$")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _LIST_RE = re.compile(r"^\s*([-*+]|\d+[.)])\s+")
 _SEP_RE = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
+_QUOTE_RE = re.compile(r"^\s*>\s?(.*)$")           # blockquote → callout box
 
 _LANG_EXT = {
     "python": ".py", "py": ".py", "javascript": ".js", "js": ".js",
@@ -73,6 +74,13 @@ def _parse_blocks(md: str) -> list[dict]:
                 items.append(_LIST_RE.sub("", lines[i]).strip())
                 i += 1
             blocks.append({"type": "list", "items": items})
+            continue
+        if _QUOTE_RE.match(line):
+            qlines = []
+            while i < n and _QUOTE_RE.match(lines[i]):
+                qlines.append(_QUOTE_RE.match(lines[i]).group(1))
+                i += 1
+            blocks.append({"type": "quote", "text": "\n".join(qlines).strip()})
             continue
         if not line.strip():
             i += 1
@@ -244,6 +252,9 @@ def _to_text(content: str, title: str):
             out += [_strip_md(b["text"]), ""]
         elif t == "list":
             out += ["  • " + _strip_md(x) for x in b["items"]] + [""]
+        elif t == "quote":
+            out += ["  | " + _strip_md(ln)
+                    for ln in b["text"].split("\n") if ln.strip()] + [""]
         elif t == "code":
             out += [b["text"], ""]
         elif t == "table":
@@ -273,21 +284,189 @@ def _to_csv(content: str, title: str):
     return buf.getvalue().encode("utf-8"), "text/csv", f"{title}.csv"
 
 
+# Document palette (kept subtle + professional).
+_ACCENT_HEX = "1F4E79"        # dark blue — title, headings, table header
+_CODE_BG = "F6F8FA"           # light gray — code box
+_CODE_BORDER = "E1E4E8"
+_CALLOUT_BG = "EAF1FB"        # light blue — callout box
+_CALLOUT_BORDER = "C6D6EF"
+_TABLE_BORDER = "BFBFBF"
+
+
+def _docx_shade(cell, fill: str) -> None:
+    """Set a table cell's background fill (python-docx has no direct API)."""
+    try:
+        from docx.oxml.ns import qn
+        from docx.oxml import OxmlElement
+        tcPr = cell._tc.get_or_add_tcPr()
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:val"), "clear")
+        shd.set(qn("w:color"), "auto")
+        shd.set(qn("w:fill"), fill)
+        tcPr.append(shd)
+    except Exception:
+        pass
+
+
+def _docx_borders(table, color: str = _TABLE_BORDER, sz: str = "4") -> None:
+    try:
+        from docx.oxml.ns import qn
+        from docx.oxml import OxmlElement
+        tblPr = table._tbl.tblPr
+        borders = OxmlElement("w:tblBorders")
+        for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            el = OxmlElement(f"w:{edge}")
+            el.set(qn("w:val"), "single")
+            el.set(qn("w:sz"), sz)
+            el.set(qn("w:color"), color)
+            borders.append(el)
+        tblPr.append(borders)
+    except Exception:
+        pass
+
+
+def _docx_page_number(section) -> None:
+    """Centered 'Page N' field in the footer."""
+    try:
+        from docx.oxml.ns import qn
+        from docx.oxml import OxmlElement
+        from docx.shared import Pt, RGBColor
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        p = section.footer.paragraphs[0]
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        lead = p.add_run("Page ")
+        lead.font.size = Pt(8)
+        lead.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+        r = p.add_run()
+        r.font.size = Pt(8)
+        r.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+        begin = OxmlElement("w:fldChar")
+        begin.set(qn("w:fldCharType"), "begin")
+        instr = OxmlElement("w:instrText")
+        instr.set(qn("xml:space"), "preserve")
+        instr.text = " PAGE "
+        end = OxmlElement("w:fldChar")
+        end.set(qn("w:fldCharType"), "end")
+        r._r.append(begin)
+        r._r.append(instr)
+        r._r.append(end)
+    except Exception:
+        pass
+
+
+def _docx_code(d, code: str) -> None:
+    """Code in a shaded, bordered, monospace box."""
+    from docx.shared import Pt, RGBColor
+    table = d.add_table(rows=1, cols=1)
+    table.autofit = True
+    _docx_borders(table, color=_CODE_BORDER, sz="4")
+    cell = table.rows[0].cells[0]
+    _docx_shade(cell, _CODE_BG)
+    p = cell.paragraphs[0]
+    p.paragraph_format.space_after = Pt(0)
+    for idx, ln in enumerate(code.split("\n")):
+        if idx:
+            p.add_run().add_break()
+        run = p.add_run(ln.rstrip())
+        run.font.name = "Consolas"
+        run.font.size = Pt(8.5)
+        run.font.color.rgb = RGBColor(0x24, 0x29, 0x2E)
+    d.add_paragraph().paragraph_format.space_after = Pt(2)
+
+
+def _docx_callout(d, text: str) -> None:
+    """A shaded, bordered callout box (e.g. Note / Important / Optimization)."""
+    table = d.add_table(rows=1, cols=1)
+    table.autofit = True
+    _docx_borders(table, color=_CALLOUT_BORDER, sz="4")
+    cell = table.rows[0].cells[0]
+    _docx_shade(cell, _CALLOUT_BG)
+    p = cell.paragraphs[0]
+    for idx, ln in enumerate(l for l in text.split("\n") if l.strip()):
+        if idx:
+            p.add_run().add_break()
+        _docx_add_runs(p, ln)
+    d.add_paragraph()
+
+
+def _docx_table(d, rows: list) -> None:
+    """Table with a shaded, bold, white header row + light grid borders."""
+    from docx.shared import RGBColor, Pt
+    cols = max(len(r) for r in rows)
+    table = d.add_table(rows=0, cols=cols)
+    table.autofit = True
+    _docx_borders(table)
+    for ri, r in enumerate(rows):
+        cells = table.add_row().cells
+        for ci in range(cols):
+            cell = cells[ci]
+            cell.paragraphs[0].text = ""
+            _docx_add_runs(cell.paragraphs[0], r[ci] if ci < len(r) else "")
+            if ri == 0:
+                _docx_shade(cell, _ACCENT_HEX)
+                for run in cell.paragraphs[0].runs:
+                    run.bold = True
+                    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+                    run.font.size = Pt(10)
+    d.add_paragraph().paragraph_format.space_after = Pt(2)
+
+
+def _docx_title(d, title: str, subtitle: Optional[str]) -> None:
+    from docx.shared import Pt, RGBColor
+    p = d.add_paragraph()
+    r = p.add_run(_strip_md(title))
+    r.bold = True
+    r.font.size = Pt(24)
+    r.font.color.rgb = RGBColor(0x1F, 0x4E, 0x79)
+    if subtitle:
+        sp = d.add_paragraph()
+        sr = sp.add_run(_strip_md(subtitle))
+        sr.font.size = Pt(13)
+        sr.italic = True
+        sr.font.color.rgb = RGBColor(0x59, 0x59, 0x59)
+    d.add_paragraph()
+
+
 def _to_docx(content: str, title: str):
     import docx
-    from docx.shared import Pt
+    from docx.shared import Pt, RGBColor, Inches
     d = docx.Document()
+
+    # Base look: Calibri body, comfortable margins, page-number footer.
+    normal = d.styles["Normal"]
+    normal.font.name = "Calibri"
+    normal.font.size = Pt(10.5)
+    for sec in d.sections:
+        sec.top_margin = Inches(0.9)
+        sec.bottom_margin = Inches(0.9)
+        sec.left_margin = Inches(1.0)
+        sec.right_margin = Inches(1.0)
+        _docx_page_number(sec)
+
     blocks = _parse_blocks(content)
+    start = 0
+    # Styled title: use the passed title, or promote the content's own first
+    # heading (with a following short line as the subtitle).
     if not _skip_title(blocks, title):
-        d.add_heading(title, 0)
-    for b in blocks:
+        _docx_title(d, title, None)
+    elif blocks:
+        subtitle = None
+        if (len(blocks) > 1 and blocks[1]["type"] == "para"
+                and len(blocks[1]["text"]) <= 140 and "\n" not in blocks[1]["text"]):
+            subtitle = blocks[1]["text"]
+            start = 2
+        else:
+            start = 1
+        _docx_title(d, _strip_md(blocks[0]["text"]), subtitle)
+
+    for b in blocks[start:]:
         t = b["type"]
         if t == "heading":
-            d.add_heading(_strip_md(b["text"]), min(b["level"], 4))
+            h = d.add_heading(level=min(b["level"], 4))
+            _docx_add_runs(h, b["text"])
+            for run in h.runs:
+                run.font.color.rgb = RGBColor(0x1F, 0x4E, 0x79)
         elif t == "para":
-            # Preserve the answer's line breaks as line breaks in one paragraph
-            # (tight spacing) instead of merging them into a run-on block; render
-            # inline **bold** as real bold.
             plines = [ln for ln in b["text"].split("\n") if ln.strip()]
             if plines:
                 p = d.add_paragraph()
@@ -298,19 +477,12 @@ def _to_docx(content: str, title: str):
         elif t == "list":
             for x in b["items"]:
                 _docx_add_runs(d.add_paragraph(style="List Bullet"), x)
+        elif t == "quote":
+            _docx_callout(d, b["text"])
         elif t == "code":
-            p = d.add_paragraph()
-            run = p.add_run(b["text"])
-            run.font.name = "Consolas"
-            run.font.size = Pt(9)
+            _docx_code(d, b["text"])
         elif t == "table" and b["rows"]:
-            cols = max(len(r) for r in b["rows"])
-            table = d.add_table(rows=0, cols=cols)
-            table.style = "Light Grid Accent 1"
-            for r in b["rows"]:
-                cells = table.add_row().cells
-                for ci, val in enumerate(r[:cols]):
-                    cells[ci].text = _strip_md(val)
+            _docx_table(d, b["rows"])
     buf = io.BytesIO()
     d.save(buf)
     return (buf.getvalue(),
@@ -344,7 +516,7 @@ def _pdf_write(pdf, h: float, text: str, markdown: bool = False) -> None:
 
 
 def _pdf_table(pdf, rows: list) -> None:
-    """Render a real bordered table (grid) with a bold header row. Falls back to
+    """A bordered table with a shaded, white, bold header row. Falls back to
     pipe-joined lines if fpdf can't fit the layout (e.g. a very wide table)."""
     ncols = max((len(r) for r in rows), default=0)
     if ncols == 0:
@@ -352,8 +524,11 @@ def _pdf_table(pdf, rows: list) -> None:
     data = [[_latin(_strip_md(c)) for c in r] + [""] * (ncols - len(r))
             for r in rows]
     try:
-        with pdf.table(first_row_as_headings=True, text_align="LEFT",
-                       line_height=6) as table:
+        from fpdf.fonts import FontFace
+        headings = FontFace(emphasis="BOLD", color=(255, 255, 255),
+                            fill_color=(31, 78, 121))
+        with pdf.table(first_row_as_headings=True, headings_style=headings,
+                       text_align="LEFT", line_height=6) as table:
             for r in data:
                 trow = table.row()
                 for cell in r:
@@ -364,25 +539,99 @@ def _pdf_table(pdf, rows: list) -> None:
             _pdf_write(pdf, 5, " | ".join(_strip_md(c) for c in r))
 
 
+def _pdf_code(pdf, code: str) -> None:
+    """Code in a shaded (light-gray) monospace block."""
+    from fpdf.enums import XPos, YPos
+    pdf.ln(1)
+    pdf.set_font("Courier", "", 8)
+    pdf.set_fill_color(244, 245, 247)
+    pdf.set_text_color(36, 41, 46)
+    for raw in (code or "").split("\n"):
+        line = re.sub(r"(\S{100})", r"\1 ", _latin(raw.rstrip()))
+        try:
+            pdf.multi_cell(0, 4.6, line if line else " ", fill=True,
+                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        except Exception:
+            continue
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(2)
+
+
+def _pdf_callout(pdf, text: str) -> None:
+    """A shaded (light-blue) callout box (Note / Important / Optimization…)."""
+    from fpdf.enums import XPos, YPos
+    pdf.ln(1)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_fill_color(234, 241, 251)
+    pdf.set_text_color(20, 40, 70)
+    for raw in (l for l in text.split("\n") if l.strip()):
+        line = re.sub(r"(\S{90})", r"\1 ", _latin(raw))
+        try:
+            pdf.multi_cell(0, 6, line, markdown=True, fill=True,
+                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        except Exception:
+            try:
+                pdf.multi_cell(0, 6, line, fill=True,
+                               new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            except Exception:
+                continue
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(2)
+
+
 def _to_pdf(content: str, title: str):
     from fpdf import FPDF
-    pdf = FPDF()
-    pdf.set_auto_page_break(True, margin=15)
+
+    class _StyledPDF(FPDF):
+        def footer(self):  # centered 'Page N' on every page
+            self.set_y(-12)
+            self.set_font("Helvetica", "", 8)
+            self.set_text_color(128, 128, 128)
+            try:
+                self.cell(0, 8, f"Page {self.page_no()}", align="C")
+            except Exception:
+                pass
+            self.set_text_color(0, 0, 0)
+
+    pdf = _StyledPDF()
+    pdf.set_auto_page_break(True, margin=16)
     pdf.add_page()
     blocks = _parse_blocks(content)
+    start = 0
+
+    def _title(t: str, sub: Optional[str]) -> None:
+        pdf.set_font("Helvetica", "B", 22)
+        pdf.set_text_color(31, 78, 121)
+        _pdf_write(pdf, 10, _strip_md(t))
+        if sub:
+            pdf.set_font("Helvetica", "I", 12)
+            pdf.set_text_color(89, 89, 89)
+            _pdf_write(pdf, 7, _strip_md(sub))
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(3)
+
     if not _skip_title(blocks, title):
-        pdf.set_font("Helvetica", "B", 16)
-        _pdf_write(pdf, 9, title)
-        pdf.ln(2)
-    for b in blocks:
+        _title(title, None)
+    elif blocks:
+        sub = None
+        if (len(blocks) > 1 and blocks[1]["type"] == "para"
+                and len(blocks[1]["text"]) <= 140 and "\n" not in blocks[1]["text"]):
+            sub = blocks[1]["text"]
+            start = 2
+        else:
+            start = 1
+        _title(_strip_md(blocks[0]["text"]), sub)
+
+    for b in blocks[start:]:
         t = b["type"]
         if t == "heading":
             pdf.set_font("Helvetica", "B", max(11, 17 - b["level"]))
+            pdf.set_text_color(31, 78, 121)
             _pdf_write(pdf, 7, _strip_md(b["text"]))
+            pdf.set_text_color(0, 0, 0)
             pdf.ln(1)
         elif t == "para":
             pdf.set_font("Helvetica", "", 11)
-            # Raw text + markdown so inline **bold** renders; line breaks kept.
             _pdf_write(pdf, 6, b["text"], markdown=True)
             pdf.ln(1)
         elif t == "list":
@@ -390,10 +639,10 @@ def _to_pdf(content: str, title: str):
             for x in b["items"]:
                 _pdf_write(pdf, 6, "-  " + x, markdown=True)
             pdf.ln(1)
+        elif t == "quote":
+            _pdf_callout(pdf, b["text"])
         elif t == "code":
-            pdf.set_font("Courier", "", 8)
-            _pdf_write(pdf, 4.5, b["text"])
-            pdf.ln(1)
+            _pdf_code(pdf, b["text"])
         elif t == "table" and b["rows"]:
             pdf.set_font("Helvetica", "", 9)
             _pdf_table(pdf, b["rows"])
@@ -454,7 +703,7 @@ def _to_pptx(content: str, title: str):
         if b["type"] == "heading":
             flush()
             state["title"] = _strip_md(b["text"])
-        elif b["type"] == "para":
+        elif b["type"] in ("para", "quote"):
             state["bullets"].extend(
                 _strip_md(ln) for ln in b["text"].split("\n") if ln.strip())
         elif b["type"] == "list":

@@ -9,7 +9,8 @@ import logging
 from typing import Optional
 
 from ..config import get_settings
-from ..memory import episodic, project_brain, semantic, skills_extractor, working
+from ..memory import (episodic, memory_graph, memory_prefs, project_brain,
+                      semantic, skills_extractor, working)
 from ..rag import knowledge_graph
 
 logger = logging.getLogger(__name__)
@@ -19,9 +20,13 @@ class MemoryManager:
     async def auto_search(self, conversation_id: int, query: str,
                           owner_id: Optional[int] = None) -> Optional[str]:
         """Return the turn-start memory blocks — '## Relevant Memory' (episodic)
-        and '## About the user' (semantic skills). Owner-scoped; None if empty."""
+        and '## About the user' (semantic skills). Owner-scoped; None if empty.
+        Honors the user's Settings → Memory switches."""
         if owner_id is None:
             return None
+        prefs = memory_prefs.effective(owner_id)
+        if not prefs["recall_enabled"]:
+            return None            # user turned recall off — answer with no memory
         blocks: list[str] = []
         try:
             chunks = await episodic.search(owner_id, query,
@@ -33,7 +38,7 @@ class MemoryManager:
         except Exception as exc:
             logger.warning(f"[Memory] auto_search episodic failed: {exc}")
         try:
-            if get_settings().memory_semantic_recall_enabled:
+            if prefs["semantic_recall_enabled"]:
                 skills = await semantic.search(
                     owner_id, query, top_k=get_settings().memory_skill_recall_top_k)
                 if skills:
@@ -41,13 +46,25 @@ class MemoryManager:
                                   "\n".join(f"- {s['content']}" for s in skills))
         except Exception as exc:
             logger.warning(f"[Memory] auto_search semantic failed: {exc}")
+        # Personal memory graph (Part D Phase 5): the people/orgs + tools/tech
+        # relevant to this message — query-matched, so low token cost.
+        try:
+            if prefs["graph_enabled"]:
+                facts = await memory_graph.render(owner_id, query)
+                if facts:
+                    blocks.append("## What I know about you\n" + facts)
+        except Exception as exc:
+            logger.warning(f"[Memory] auto_search graph failed: {exc}")
         return "\n\n".join(blocks) if blocks else None
 
     async def auto_store(self, conversation_id: int, user_message: str,
                          assistant_message: str, owner_id: Optional[int] = None,
                          user_id: Optional[int] = None) -> None:
-        """Push the turn into working memory (always) and persist it to the
-        owner's durable episodic memory (when an owner is known)."""
+        """Push the turn into working memory (always — it's in-process and dies
+        with the conversation) and persist it to the owner's durable episodic
+        memory. Honors the user's Settings → Memory switches: with recording off
+        nothing durable is written, and the layers that derive FROM the durable
+        log (reflection, graph) are skipped too."""
         try:
             working.remember(conversation_id, "user", user_message)
             working.remember(conversation_id, "assistant", assistant_message)
@@ -55,6 +72,9 @@ class MemoryManager:
             pass
         if owner_id is None:
             return
+        prefs = memory_prefs.effective(owner_id)
+        if not prefs["record_enabled"]:
+            return                 # user turned recording off — learn nothing
         try:
             await episodic.store(owner_id, conversation_id,
                                  [user_message, assistant_message], user_id=user_id)
@@ -63,7 +83,8 @@ class MemoryManager:
         # Debounced background reflection: distil episodes+feedback → skills,
         # project knowledge → project brain, and content → knowledge graph.
         try:
-            skills_extractor.maybe_reflect(owner_id, conversation_id)
+            if prefs["reflect_enabled"]:
+                skills_extractor.maybe_reflect(owner_id, conversation_id)
         except Exception:
             pass
         try:
@@ -71,7 +92,14 @@ class MemoryManager:
         except Exception:
             pass
         try:
-            knowledge_graph.maybe_extract(owner_id, conversation_id)
+            # async: must be awaited or the coroutine is created and discarded.
+            await knowledge_graph.maybe_extract(owner_id, conversation_id)
+        except Exception:
+            pass
+        # Personal memory graph: people/orgs + tools/tech about the user.
+        try:
+            if prefs["graph_enabled"]:
+                await memory_graph.maybe_extract(owner_id, conversation_id)
         except Exception:
             pass
 

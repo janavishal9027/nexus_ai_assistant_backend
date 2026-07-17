@@ -190,16 +190,27 @@ async def _handle_ws_chat(session_id: str, data: dict, owner_id: int | None = No
             "type": "conversation", "conversation_id": conversation_id})
 
         full = ""
+        stopped = False
         async for chunk in stream_result.stream:
             full += chunk
             await ws_manager.send(session_id, {"type": "token", "content": chunk})
-        if citations:
+            # Client-side Stop closes the WS; ws_manager drops the session on the
+            # failed send. Detect that and STOP generating so we persist the
+            # PARTIAL answer — otherwise the backend runs to completion and the DB
+            # keeps a full response, which is what other devices load on reload.
+            if not ws_manager.is_active(session_id):
+                logger.info(f"[AgentGateway] {session_id} stopped/disconnected mid-stream; persisting partial")
+                stopped = True
+                break
+        if citations and not stopped:
             full += f"\n\n{citations}"
             await ws_manager.send(session_id, {"type": "token", "content": f"\n\n{citations}"})
 
-        # Persist the assistant message (agent_stream_chat persists only the user turn).
+        # Persist the assistant message — the partial when stopped (agent_stream_chat
+        # persists only the user turn).
         db.add(Message(conversation_id=conversation_id, role="assistant", content=full,
-                       model_used=stream_result.model_id, platform_used=stream_result.platform))
+                       model_used=stream_result.model_id, platform_used=stream_result.platform,
+                       stopped=stopped))
         conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
         if conv:
             conv.updated_at = datetime.now(timezone.utc)

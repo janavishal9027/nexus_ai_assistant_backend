@@ -8,6 +8,9 @@ class MessageDto(BaseModel):
     content: str
     model: Optional[str] = None
     platform: Optional[str] = None
+    # True when this assistant turn was stopped mid-stream (partial) — the client
+    # then suppresses the download/document offer for it.
+    stopped: bool = False
     # Image data URLs (data:image/...;base64,...) attached to this turn. When
     # present, providers send the message as OpenAI-style multimodal content so
     # a vision model can see the images. Not persisted; used at call time only.

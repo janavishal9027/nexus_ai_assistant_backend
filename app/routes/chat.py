@@ -4,7 +4,7 @@ Chat endpoints — delegates to the Agent orchestration layer.
 import asyncio
 import json
 import logging
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 from sqlalchemy.orm import Session
@@ -24,6 +24,7 @@ from ..services.agent import agent_chat, agent_stream_chat
 from ..services.multimodal_chat import multimodal_stream_chat
 from ..services.clarifier import assess_clarification
 from ..services.suggester import suggest_followups
+from ..services.starters import generate_starters
 from ..services.document_decision import decide_document
 from ..services.document_export import export_document
 from ..services.auth import get_current_account
@@ -145,6 +146,22 @@ async def suggest(request: SuggestRequest, db: Session = Depends(get_db),
     return SuggestResponse(suggestions=items)
 
 
+@router.get("/starters")
+async def starters(model: Optional[str] = Query(None),
+                   db: Session = Depends(get_db),
+                   account: Account = Depends(get_current_account)):
+    """Fresh, LLM-generated conversation starters for the new-chat empty state:
+    a current-tech/coding one, a globally-relevant idea, and a writing task.
+    Regenerated each call; fails open to a varied default set."""
+    request_context.set_owner_id(account.id)
+    try:
+        items = await generate_starters(db, owner_id=account.id, model=model)
+    except Exception as e:
+        logger.warning(f"[Starters] failed: {e}")
+        items = []
+    return {"starters": items}
+
+
 @router.post("/document-decision", response_model=DocumentDecisionResponse)
 async def document_decision(request: DocumentDecisionRequest, db: Session = Depends(get_db),
                             account: Account = Depends(get_current_account)):
@@ -257,7 +274,22 @@ async def stream_message(request: ChatRequest, db: Session = Depends(get_db),
                 })
             except asyncio.CancelledError:
                 logger.warning(f"[ChatRouter/Stream] Client disconnected during streaming")
-                # Don't yield error, just let the connection close gracefully
+                # Persist the PARTIAL answer so a reload shows the same stopped
+                # response on every device (consistent with the WS path), instead
+                # of dropping it (mobile would show nothing) or keeping a full one.
+                if full_content.strip():
+                    try:
+                        db.add(Message(
+                            conversation_id=conversation_id, role="assistant",
+                            content=full_content, model_used=result.model_id,
+                            platform_used=result.platform, stopped=True))
+                        conv = db.query(Conversation).filter(
+                            Conversation.id == conversation_id).first()
+                        if conv:
+                            conv.updated_at = datetime.now(timezone.utc)
+                        db.commit()
+                    except Exception:
+                        db.rollback()
                 return
             except Exception as e:
                 logger.error(f"[ChatRouter/Stream] Error in stream generator: {e}", exc_info=True)
